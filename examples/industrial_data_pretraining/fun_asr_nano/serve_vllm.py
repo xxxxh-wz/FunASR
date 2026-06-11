@@ -22,6 +22,8 @@ import os
 import re
 import time
 import tempfile
+import zipfile
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 import soundfile as sf
@@ -48,7 +50,7 @@ def truncate_repetition(text, min_repeat_len=3, max_repeats=3):
 
 try:
     from fastapi import FastAPI, File, UploadFile, Form, WebSocket, WebSocketDisconnect
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, Response
     import uvicorn
 except ImportError:
     raise ImportError("pip install fastapi uvicorn python-multipart")
@@ -95,6 +97,34 @@ def build_hotword_context(hotwords=None, template=None):
     return prompt_template.format(hotwords=text)
 
 
+def spk_model_kwargs(spk_model, device):
+    kwargs = {"model": spk_model, "device": device, "disable_update": True}
+    if spk_model and os.path.exists(spk_model):
+        kwargs["model"] = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
+        kwargs["model_path"] = spk_model
+    return kwargs
+
+
+def health_payload():
+    return {
+        "status": "ok",
+        "supported_routes": sorted(SUPPORTED_BATCH_ROUTES),
+        "models_loaded": {
+            "fun_asr_nano_vllm": _engine is not None,
+            "qwen3_asr": _qwen_model is not None,
+            "qwen3_asr_vllm": _qwen_vllm_model is not None,
+            "vad": _vad_model is not None,
+            "spk": _spk_model is not None,
+        },
+        "model_paths": {
+            "fun_asr_nano_vllm": getattr(_args, "model", None) if _args is not None else None,
+            "qwen3_asr": getattr(_args, "qwen_model", None) if _args is not None else None,
+            "vad": getattr(_args, "vad_model", None) if _args is not None else None,
+            "spk": getattr(_args, "spk_model", None) if _args is not None else None,
+        },
+    }
+
+
 def load_engine(args):
     global _engine, _vad_model, _spk_model, _args
     _args = args
@@ -114,7 +144,7 @@ def load_engine(args):
         _vad_model = AutoModel(model=args.vad_model, device=args.device, disable_update=True)
         if args.spk_model:
             logger.info(f"Loading SPK: {args.spk_model}")
-            _spk_model = AutoModel(model=args.spk_model, device=args.device, disable_update=True)
+            _spk_model = AutoModel(**spk_model_kwargs(args.spk_model, args.device))
         else:
             logger.info("SPK disabled")
         logger.info("All models ready!")
@@ -497,6 +527,147 @@ def read_audio_upload(content, filename="audio"):
         return audio_data, sr
 
 
+def validate_batch_request(files, model):
+    if model not in SUPPORTED_BATCH_ROUTES:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"unsupported model route for this service: {model}",
+                "supported_routes": sorted(SUPPORTED_BATCH_ROUTES),
+            },
+        )
+
+    max_batch_size = getattr(_args, "max_batch_size", 8) if _args is not None else 8
+    if len(files) > max_batch_size:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"batch size {len(files)} exceeds max_batch_size {max_batch_size}",
+                "max_batch_size": max_batch_size,
+            },
+        )
+    return None
+
+
+def select_batch_processor(model):
+    if model in QWEN3_VLLM_BATCH_ROUTES:
+        return process_audio_qwen3_vllm
+    if model in QWEN3_BATCH_ROUTES:
+        return process_audio_qwen3
+    return process_audio
+
+
+def model_path_for_route(model):
+    if model in (QWEN3_BATCH_ROUTES | QWEN3_VLLM_BATCH_ROUTES):
+        return getattr(_args, "qwen_model", "Qwen/Qwen3-ASR-1.7B")
+    return getattr(_args, "model", "FunAudioLLM/Fun-ASR-Nano-2512")
+
+
+async def process_batch_upload_file(
+    file,
+    *,
+    model,
+    language=None,
+    hotwords=None,
+    hotword_prompt_template=None,
+    speaker_diarization=True,
+    timestamps=True,
+):
+    item_t0 = time.perf_counter()
+    file_name = file.filename or "unknown"
+    hotwords_count = len(hotwords or [])
+    try:
+        content = await file.read()
+        audio_data, sr = read_audio_upload(content, file_name)
+        processor = select_batch_processor(model)
+        processor_kwargs = {
+            "language": language or None,
+            "hotwords": hotwords,
+            "use_spk": speaker_diarization,
+            "use_timestamp": timestamps,
+        }
+        if processor in (process_audio_qwen3, process_audio_qwen3_vllm):
+            processor_kwargs["hotword_prompt_template"] = hotword_prompt_template
+        result = processor(
+            audio_data,
+            sr=sr,
+            **processor_kwargs,
+        )
+        item_elapsed = time.perf_counter() - item_t0
+        result.update(
+            {
+                "file_name": file_name,
+                "status": "success",
+                "model_path": model_path_for_route(model),
+                "processing_time": round(item_elapsed, 3),
+                "rtf": round(item_elapsed / result["duration"], 4) if result.get("duration", 0) > 0 else 0,
+                "hotwords_applied": hotwords_count > 0,
+                "hotwords_count": hotwords_count,
+            }
+        )
+        return result
+    except Exception as exc:
+        logger.exception("Batch ASR failed for %s", file_name)
+        return {
+            "file_name": file_name,
+            "status": "failed",
+            "error": str(exc),
+            "processing_time": round(time.perf_counter() - item_t0, 3),
+            "hotwords_applied": hotwords_count > 0,
+            "hotwords_count": hotwords_count,
+        }
+
+
+def parse_output_formats(raw_formats):
+    formats = [item.strip().lower() for item in re.split(r"[,，\s]+", raw_formats or "") if item.strip()]
+    formats = formats or ["md", "srt", "json"]
+    supported = {"md", "srt", "json"}
+    unsupported = [item for item in formats if item not in supported]
+    if unsupported:
+        raise ValueError(f"unsupported output format: {', '.join(unsupported)}")
+    return tuple(dict.fromkeys(formats))
+
+
+def safe_zip_stem(file_name):
+    raw_name = str(file_name or "audio").replace("\\", "/")
+    parts = [part for part in PurePosixPath(raw_name).parts if part not in ("", ".", "..", "/")]
+    if not parts:
+        parts = ["audio"]
+    return str(PurePosixPath(*parts).with_suffix(""))
+
+
+def subtitle_error_json(result):
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def subtitle_files_for_result(result, *, model, language, formats):
+    from batch_transcriber.config import BatchConfig
+    from batch_transcriber.formatter import render_json, render_markdown, render_srt
+    from batch_transcriber.scanner import AudioTask
+
+    stem = safe_zip_stem(result.get("file_name"))
+    if result.get("status") != "success":
+        return {f"{stem}.error.json": subtitle_error_json(result)}
+
+    source_path = PurePosixPath(f"{stem}.audio")
+    task = AudioTask(
+        source_path=Path(source_path.as_posix()),
+        relative_path=Path(source_path.as_posix()),
+        output_md=Path(PurePosixPath(f"{stem}.md").as_posix()),
+        output_srt=Path(PurePosixPath(f"{stem}.srt").as_posix()),
+        output_json=Path(PurePosixPath(f"{stem}.json").as_posix()),
+    )
+    config = BatchConfig(route=model, language=language or "auto")
+    outputs = {}
+    if "md" in formats:
+        outputs[f"{stem}.md"] = render_markdown(task, result, model, language or "auto", config=config)
+    if "srt" in formats:
+        outputs[f"{stem}.srt"] = render_srt(result, config=config)
+    if "json" in formats:
+        outputs[f"{stem}.json"] = render_json(task, result, model, language or "auto", config=config)
+    return outputs
+
+
 # ============================================================
 # FastAPI App
 # ============================================================
@@ -506,6 +677,11 @@ app = FastAPI(title="Fun-ASR-Nano vLLM Server", version="1.0")
 @app.on_event("startup")
 async def startup():
     load_engine(_args)
+
+
+@app.get("/healthz")
+async def healthz():
+    return health_payload()
 
 
 # --- HTTP REST: POST /asr ---
@@ -545,24 +721,9 @@ async def asr_batch_endpoint(
     output_granularity: str = Form(default="sentence"),
 ):
     """Batch ASR with multiple file uploads in one request."""
-    if model not in SUPPORTED_BATCH_ROUTES:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": f"unsupported model route for this service: {model}",
-                "supported_routes": sorted(SUPPORTED_BATCH_ROUTES),
-            },
-        )
-
-    max_batch_size = getattr(_args, "max_batch_size", 8) if _args is not None else 8
-    if len(files) > max_batch_size:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": f"batch size {len(files)} exceeds max_batch_size {max_batch_size}",
-                "max_batch_size": max_batch_size,
-            },
-        )
+    validation_error = validate_batch_request(files, model)
+    if validation_error is not None:
+        return validation_error
 
     hw_list = parse_hotwords(hotwords)
     hotwords_count = len(hw_list or [])
@@ -571,59 +732,17 @@ async def asr_batch_endpoint(
     batch_t0 = time.perf_counter()
 
     for file in files:
-        item_t0 = time.perf_counter()
-        file_name = file.filename or "unknown"
-        try:
-            content = await file.read()
-            audio_data, sr = read_audio_upload(content, file_name)
-            if model in QWEN3_VLLM_BATCH_ROUTES:
-                processor = process_audio_qwen3_vllm
-            elif model in QWEN3_BATCH_ROUTES:
-                processor = process_audio_qwen3
-            else:
-                processor = process_audio
-            processor_kwargs = {
-                "language": language or None,
-                "hotwords": hw_list,
-                "use_spk": speaker_diarization,
-                "use_timestamp": timestamps,
-            }
-            if processor in (process_audio_qwen3, process_audio_qwen3_vllm):
-                processor_kwargs["hotword_prompt_template"] = hotword_template
-            result = processor(
-                audio_data,
-                sr=sr,
-                **processor_kwargs,
+        results.append(
+            await process_batch_upload_file(
+                file,
+                model=model,
+                language=language,
+                hotwords=hw_list,
+                hotword_prompt_template=hotword_template,
+                speaker_diarization=speaker_diarization,
+                timestamps=timestamps,
             )
-            item_elapsed = time.perf_counter() - item_t0
-            result.update(
-                {
-                    "file_name": file_name,
-                    "status": "success",
-                    "model_path": (
-                        getattr(_args, "qwen_model", "Qwen/Qwen3-ASR-1.7B")
-                        if model in (QWEN3_BATCH_ROUTES | QWEN3_VLLM_BATCH_ROUTES)
-                        else getattr(_args, "model", "FunAudioLLM/Fun-ASR-Nano-2512")
-                    ),
-                    "processing_time": round(item_elapsed, 3),
-                    "rtf": round(item_elapsed / result["duration"], 4) if result.get("duration", 0) > 0 else 0,
-                    "hotwords_applied": hotwords_count > 0,
-                    "hotwords_count": hotwords_count,
-                }
-            )
-            results.append(result)
-        except Exception as exc:
-            logger.exception("Batch ASR failed for %s", file_name)
-            results.append(
-                {
-                    "file_name": file_name,
-                    "status": "failed",
-                    "error": str(exc),
-                    "processing_time": round(time.perf_counter() - item_t0, 3),
-                    "hotwords_applied": hotwords_count > 0,
-                    "hotwords_count": hotwords_count,
-                }
-            )
+        )
 
     return JSONResponse(
         content={
@@ -635,6 +754,58 @@ async def asr_batch_endpoint(
             "processing_time": round(time.perf_counter() - batch_t0, 3),
             "results": results,
         }
+    )
+
+
+@app.post("/asr/subtitles")
+async def asr_subtitles_endpoint(
+    files: list[UploadFile] = File(...),
+    model: str = Form(default="qwen3-asr-vllm"),
+    language: str = Form(default=None),
+    hotwords: str = Form(default=""),
+    hotword_prompt_template: str = Form(default=""),
+    speaker_diarization: bool = Form(default=True),
+    timestamps: bool = Form(default=True),
+    output_granularity: str = Form(default="sentence"),
+    output_formats: str = Form(default="md,srt,json"),
+):
+    """Batch ASR and return generated subtitle/transcript files as a zip archive."""
+    validation_error = validate_batch_request(files, model)
+    if validation_error is not None:
+        return validation_error
+
+    try:
+        formats = parse_output_formats(output_formats)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc), "supported_formats": ["md", "srt", "json"]})
+
+    hw_list = parse_hotwords(hotwords)
+    hotword_template = hotword_prompt_template or None
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file in files:
+            result = await process_batch_upload_file(
+                file,
+                model=model,
+                language=language,
+                hotwords=hw_list,
+                hotword_prompt_template=hotword_template,
+                speaker_diarization=speaker_diarization,
+                timestamps=timestamps,
+            )
+            for archive_name, content in subtitle_files_for_result(
+                result,
+                model=model,
+                language=language,
+                formats=formats,
+            ).items():
+                archive.writestr(archive_name, content)
+
+    buffer.seek(0)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="subtitles.zip"'},
     )
 
 

@@ -1,0 +1,58 @@
+services:
+  asr-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.asr
+    image: funasr-local-asr:latest
+    ports:
+      - "${FUNASR_HOST_PORT:-8000}:8000"
+    environment:
+      FUNASR_PORT: "8000"
+      MODELSCOPE_CACHE: /models
+      HF_HOME: /models
+      UV_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+      CUDA_VISIBLE_DEVICES: "${CUDA_VISIBLE_DEVICES:-0}"
+    volumes:
+      - /home/dell/models:/models
+      - ./音频文件:/data/input
+      - ./听译结果:/data/output
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - uv
+      - run
+      - python
+      - examples/industrial_data_pretraining/fun_asr_nano/serve_vllm.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --hub
+      - ms
+      - --model
+      - /models/FunAudioLLM/Fun-ASR-Nano-2512
+      - --qwen-model
+      - /models/Qwen/Qwen3-ASR-1___7B
+      - --vad-model
+      - /models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
+      - --spk-model
+      - /models/iic/speech_eres2netv2_sv_zh-cn_16k-common
+      - --gpu-memory-utilization
+      - "0.18"
+      - --qwen-gpu-memory-utilization
+      - "0.18"
+      - --qwen-max-model-len
+      - "8192"
+      - --qwen-max-inference-batch-size
+      - "16"
+      - --qwen-max-new-tokens
+      - "1024"
+      - --max-batch-size
+      - "8"

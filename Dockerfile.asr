@@ -1,0 +1,44 @@
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV MODELSCOPE_CACHE=/models
+ENV HF_HOME=/models
+ENV FUNASR_PORT=8000
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        git \
+        libsndfile1 \
+        python3.10-dev \
+        python3.11 \
+        python3.11-dev \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+COPY pyproject.toml uv.lock README.md LICENSE MODEL_LICENSE ./
+COPY batch_transcriber ./batch_transcriber
+COPY examples ./examples
+COPY fun_text_processing ./fun_text_processing
+COPY funasr ./funasr
+COPY model_zoo ./model_zoo
+COPY setup.py ./
+
+RUN uv sync --frozen
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+    CMD uv run python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.getenv('FUNASR_PORT', '8000'), timeout=3).read()" || exit 1
+
+CMD ["uv", "run", "python", "examples/industrial_data_pretraining/fun_asr_nano/serve_vllm.py", "--host", "0.0.0.0", "--port", "8000"]

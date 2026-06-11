@@ -1,6 +1,8 @@
 import importlib.util
+import io
 import json
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +38,34 @@ def _wav_upload(filename="a.wav"):
 
 def _json_response_payload(response):
     return json.loads(response.body.decode("utf-8"))
+
+
+def _zip_response_entries(response):
+    with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+        return {name: archive.read(name).decode("utf-8") for name in archive.namelist()}
+
+
+def test_healthz_reports_supported_routes_and_model_state(monkeypatch):
+    module = _load_server_module()
+    module._engine = object()
+    module._qwen_model = None
+    module._qwen_vllm_model = object()
+    module._vad_model = object()
+    module._spk_model = None
+    module._args = type("Args", (), {"model": "/models/nano", "qwen_model": "/models/qwen"})()
+
+    payload = module.asyncio.run(module.healthz())
+
+    assert payload["status"] == "ok"
+    assert "qwen3-asr-vllm" in payload["supported_routes"]
+    assert payload["models_loaded"] == {
+        "fun_asr_nano_vllm": True,
+        "qwen3_asr": False,
+        "qwen3_asr_vllm": True,
+        "vad": True,
+        "spk": False,
+    }
+    assert payload["model_paths"]["qwen3_asr"] == "/models/qwen"
 
 
 def test_asr_batch_returns_per_file_results(monkeypatch, tmp_path):
@@ -170,6 +200,20 @@ def test_qwen3_asr_uses_templated_hotword_context(monkeypatch):
     )
 
     assert calls["context"] == "以下是本段音频可能出现的专有名词、课程术语或人名，请在转写时优先参考：线性映射、矩阵表示"
+
+
+def test_local_spk_model_path_uses_registered_model_key(monkeypatch):
+    module = _load_server_module()
+    monkeypatch.setattr(module.os.path, "exists", lambda path: path == "/models/iic/speech_eres2netv2_sv_zh-cn_16k-common")
+
+    kwargs = module.spk_model_kwargs("/models/iic/speech_eres2netv2_sv_zh-cn_16k-common", "cuda:0")
+
+    assert kwargs == {
+        "model": "iic/speech_eres2netv2_sv_zh-cn_16k-common",
+        "model_path": "/models/iic/speech_eres2netv2_sv_zh-cn_16k-common",
+        "device": "cuda:0",
+        "disable_update": True,
+    }
 
 
 def test_asr_batch_routes_qwen3_asr_vllm_to_vllm_processor(monkeypatch):
@@ -393,3 +437,97 @@ def test_asr_batch_rejects_unsupported_route(monkeypatch):
     assert "fun-asr-nano-vllm" in payload["supported_routes"]
     assert "qwen3-asr" in payload["supported_routes"]
     assert "qwen3-asr-vllm" in payload["supported_routes"]
+
+
+def test_asr_subtitles_returns_zip_with_srt_md_json(monkeypatch):
+    module = _load_server_module()
+    monkeypatch.setattr(module, "load_engine", lambda args: None)
+
+    def fake_process_audio_qwen3_vllm(
+        audio_data,
+        sr=16000,
+        language=None,
+        hotwords=None,
+        hotword_prompt_template=None,
+        use_vad=True,
+        use_spk=False,
+        use_timestamp=True,
+    ):
+        return {
+            "text": "约当块 测试",
+            "duration": 1.5,
+            "segments": [{"start": 0.0, "end": 1.5, "speaker": "SPK0", "text": "约当块 测试"}],
+        }
+
+    monkeypatch.setattr(module, "process_audio_qwen3_vllm", fake_process_audio_qwen3_vllm)
+
+    response = module.asyncio.run(
+        module.asr_subtitles_endpoint(
+            files=[_wav_upload("class/a.wav")],
+            model="qwen3-asr-vllm",
+            language="zh",
+            hotwords="约当块",
+            hotword_prompt_template="",
+            speaker_diarization=True,
+            timestamps=True,
+            output_granularity="sentence",
+            output_formats="md,srt,json",
+        )
+    )
+
+    assert response.status_code == 200
+    assert response.media_type == "application/zip"
+    entries = _zip_response_entries(response)
+    assert set(entries) == {"class/a.md", "class/a.srt", "class/a.json"}
+    assert "约当块 测试" in entries["class/a.srt"]
+    assert "热词：已启用，1 个" in entries["class/a.md"]
+    assert json.loads(entries["class/a.json"])["hotwords_count"] == 1
+
+
+def test_asr_subtitles_records_per_file_failure_as_error_json(monkeypatch):
+    module = _load_server_module()
+    monkeypatch.setattr(module, "load_engine", lambda args: None)
+    monkeypatch.setattr(module, "read_audio_upload", lambda content, filename: (_ for _ in ()).throw(RuntimeError("decode failed")))
+
+    response = module.asyncio.run(
+        module.asr_subtitles_endpoint(
+            files=[FakeUpload("../bad.wav", b"bad")],
+            model="qwen3-asr-vllm",
+            language=None,
+            hotwords="",
+            hotword_prompt_template="",
+            speaker_diarization=True,
+            timestamps=True,
+            output_granularity="sentence",
+            output_formats="srt",
+        )
+    )
+
+    assert response.status_code == 200
+    entries = _zip_response_entries(response)
+    assert set(entries) == {"bad.error.json"}
+    error_payload = json.loads(entries["bad.error.json"])
+    assert error_payload["status"] == "failed"
+    assert "decode failed" in error_payload["error"]
+
+
+def test_asr_subtitles_rejects_unsupported_output_format(monkeypatch):
+    module = _load_server_module()
+    monkeypatch.setattr(module, "load_engine", lambda args: None)
+
+    response = module.asyncio.run(
+        module.asr_subtitles_endpoint(
+            files=[_wav_upload("a.wav")],
+            model="qwen3-asr-vllm",
+            language=None,
+            hotwords="",
+            hotword_prompt_template="",
+            speaker_diarization=True,
+            timestamps=True,
+            output_granularity="sentence",
+            output_formats="md,docx",
+        )
+    )
+
+    assert response.status_code == 400
+    assert "unsupported output format" in _json_response_payload(response)["error"]
