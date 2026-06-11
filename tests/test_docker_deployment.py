@@ -24,8 +24,11 @@ def test_asr_compose_mounts_models_audio_outputs_and_gpu():
     assert "/home/dell/models:/models" in service["volumes"]
     assert "./音频文件:/data/input" in service["volumes"]
     assert "./听译结果:/data/output" in service["volumes"]
+    assert service["environment"]["CUDA_VISIBLE_DEVICES"] == "0"
     assert "qwen3-asr-vllm" not in command
     assert "--qwen-model" in command
     assert "/models/Qwen/Qwen3-ASR-1___7B" in command
     assert "--qwen-gpu-memory-utilization" in command
-    assert service["deploy"]["resources"]["reservations"]["devices"][0]["capabilities"] == ["gpu"]
+    gpu_device = service["deploy"]["resources"]["reservations"]["devices"][0]
+    assert gpu_device["device_ids"] == ["${FUNASR_GPU_DEVICE:-0}"]
+    assert gpu_device["capabilities"] == ["gpu"]

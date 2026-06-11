@@ -61,9 +61,18 @@ docker compose -f docker-compose.asr.yml build
 启动服务：
 
 ```bash
-FUNASR_HOST_PORT=8903 CUDA_VISIBLE_DEVICES=0 \
-docker compose -f docker-compose.asr.yml up -d --no-build asr-server
+FUNASR_HOST_PORT=8903 FUNASR_GPU_DEVICE=0 \
+docker compose -f docker-compose.asr.yml up -d --force-recreate --no-build asr-server
 ```
+
+指定宿主机 GPU 3 时：
+
+```bash
+FUNASR_HOST_PORT=8903 FUNASR_GPU_DEVICE=3 \
+docker compose -f docker-compose.asr.yml up -d --force-recreate --no-build asr-server
+```
+
+注意：`FUNASR_GPU_DEVICE` 选择宿主机 GPU；容器内固定使用 `CUDA_VISIBLE_DEVICES=0`。不要用 `CUDA_VISIBLE_DEVICES=3` 选择宿主机 GPU。
 
 查看状态：
 
@@ -394,7 +403,28 @@ model_path = /models/iic/speech_eres2netv2_sv_zh-cn_16k-common
 - RTF
 - 请求超时率
 
-### 9.7 不建议接口侧自行切 VAD
+### 9.7 宿主机 GPU 选择不要用容器内 `CUDA_VISIBLE_DEVICES`
+
+Docker compose 通过 `FUNASR_GPU_DEVICE` 选择宿主机 GPU：
+
+```bash
+FUNASR_HOST_PORT=8903 FUNASR_GPU_DEVICE=3 \
+docker compose -f docker-compose.asr.yml up -d --force-recreate --no-build asr-server
+```
+
+容器内环境固定为：
+
+```text
+CUDA_VISIBLE_DEVICES=0
+```
+
+原因：当 Docker 只给容器分配 1 张 GPU 时，容器内的可见 GPU 会重新编号为 `cuda:0`。如果把 `CUDA_VISIBLE_DEVICES=3` 传进容器，PyTorch 会尝试寻找容器内第 4 张 GPU，最终报错：
+
+```text
+RuntimeError: No CUDA GPUs are available
+```
+
+### 9.8 不建议接口侧自行切 VAD
 
 当前 pipeline 顺序是：
 
@@ -404,7 +434,7 @@ model_path = /models/iic/speech_eres2netv2_sv_zh-cn_16k-common
 
 接口侧只需上传原始音频。自行切分可能破坏上下文，导致句级时间戳和说话人结果不一致。
 
-### 9.8 热词要按课程或章节控制规模
+### 9.9 热词要按课程或章节控制规模
 
 `qwen3-asr-vllm` 使用模板化 context 承载热词，实际 A/B 中专业词改善明显。建议：
 
@@ -452,4 +482,3 @@ md,srt
 - 热词传入后 `.json` 中 `hotwords_applied=true`。
 - 首次 Qwen 请求和 warm 请求均不会超时。
 - Docker 容器状态为 `healthy`。
-

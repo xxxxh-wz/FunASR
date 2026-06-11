@@ -6,8 +6,11 @@
 
 ```bash
 docker compose -f docker-compose.asr.yml build
-docker compose -f docker-compose.asr.yml up asr-server
+FUNASR_HOST_PORT=8903 FUNASR_GPU_DEVICE=0 \
+docker compose -f docker-compose.asr.yml up -d --force-recreate --no-build asr-server
 ```
+
+`FUNASR_GPU_DEVICE` 选择宿主机 GPU。容器内固定使用 `CUDA_VISIBLE_DEVICES=0`，不要用 `CUDA_VISIBLE_DEVICES=3` 选择宿主机 GPU。
 
 默认挂载：
 

@@ -11,7 +11,7 @@ services:
       MODELSCOPE_CACHE: /models
       HF_HOME: /models
       UV_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
-      CUDA_VISIBLE_DEVICES: "${CUDA_VISIBLE_DEVICES:-0}"
+      CUDA_VISIBLE_DEVICES: "0"
     volumes:
       - /home/dell/models:/models
       - ./音频文件:/data/input
@@ -23,7 +23,8 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids:
+                - "${FUNASR_GPU_DEVICE:-0}"
               capabilities: [gpu]
     command:
       - uv
