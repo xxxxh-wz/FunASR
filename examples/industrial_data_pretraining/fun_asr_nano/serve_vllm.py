@@ -53,24 +53,31 @@ try:
 except ImportError:
     raise ImportError("pip install fastapi uvicorn python-multipart")
 
-from funasr.models.fun_asr_nano.inference_vllm import FunASRNanoVLLM
-from funasr.models.fsmn_vad_streaming.dynamic_vad import DynamicStreamingVAD
-from funasr import AutoModel
-
 
 # ============================================================
 # Global state
 # ============================================================
 _engine = None
+_qwen_model = None
+_qwen_vllm_model = None
 _vad_model = None
 _spk_model = None
 _args = None
+NANO_BATCH_ROUTES = {"fun-asr-nano-vllm", "fun-asr-nano", "FunAudioLLM/Fun-ASR-Nano-2512"}
+QWEN3_BATCH_ROUTES = {"qwen3-asr", "qwen3-asr-1.7b", "Qwen/Qwen3-ASR-1.7B"}
+QWEN3_VLLM_BATCH_ROUTES = {"qwen3-asr-vllm", "qwen3-asr-1.7b-vllm"}
+SUPPORTED_BATCH_ROUTES = NANO_BATCH_ROUTES | QWEN3_BATCH_ROUTES | QWEN3_VLLM_BATCH_ROUTES
 
 
 def load_engine(args):
     global _engine, _vad_model, _spk_model, _args
     _args = args
     if _engine is None:
+        if args is None:
+            raise RuntimeError("server args are not initialized")
+        from funasr import AutoModel
+        from funasr.models.fun_asr_nano.inference_vllm import FunASRNanoVLLM
+
         logger.info(f"Loading vLLM engine: {args.model}")
         _engine = FunASRNanoVLLM.from_pretrained(
             model=args.model, hub=args.hub, device=args.device, dtype=args.dtype,
@@ -85,6 +92,126 @@ def load_engine(args):
         else:
             logger.info("SPK disabled")
         logger.info("All models ready!")
+
+
+def load_qwen_model():
+    global _qwen_model
+    if _qwen_model is None:
+        if _args is None:
+            raise RuntimeError("server args are not initialized")
+        from funasr import AutoModel
+
+        logger.info(f"Loading Qwen3-ASR model: {_args.qwen_model}")
+        qwen_kwargs = {
+            "model": _args.qwen_model,
+            "hub": _args.hub,
+            "device": _args.device,
+            "dtype": _args.dtype,
+            "disable_update": True,
+        }
+        if os.path.exists(_args.qwen_model):
+            qwen_kwargs["model"] = "Qwen/Qwen3-ASR-1.7B"
+            qwen_kwargs["model_path"] = _args.qwen_model
+        _qwen_model = AutoModel(
+            **qwen_kwargs,
+        )
+        logger.info("Qwen3-ASR model ready!")
+    return _qwen_model
+
+
+def load_qwen_vllm_model():
+    global _qwen_vllm_model
+    if _qwen_vllm_model is None:
+        if _args is None:
+            raise RuntimeError("server args are not initialized")
+        from qwen_asr import Qwen3ASRModel
+
+        logger.info(f"Loading Qwen3-ASR vLLM model: {_args.qwen_model}")
+        forced_aligner = getattr(_args, "qwen_forced_aligner", "") or None
+        forced_aligner_kwargs = None
+        if forced_aligner:
+            forced_aligner_kwargs = {
+                "dtype": getattr(torch, str(_args.dtype).replace("bf16", "bfloat16"), torch.bfloat16),
+                "device_map": _args.device,
+            }
+        qwen_kwargs = {
+            "model": _args.qwen_model,
+            "gpu_memory_utilization": getattr(_args, "qwen_gpu_memory_utilization", None) or _args.gpu_memory_utilization,
+            "max_inference_batch_size": getattr(_args, "qwen_max_inference_batch_size", 128),
+            "max_new_tokens": getattr(_args, "qwen_max_new_tokens", 4096),
+        }
+        qwen_max_model_len = getattr(_args, "qwen_max_model_len", None)
+        if qwen_max_model_len:
+            qwen_kwargs["max_model_len"] = qwen_max_model_len
+        if forced_aligner:
+            qwen_kwargs["forced_aligner"] = forced_aligner
+            qwen_kwargs["forced_aligner_kwargs"] = forced_aligner_kwargs
+        _qwen_vllm_model = Qwen3ASRModel.LLM(**qwen_kwargs)
+        logger.info("Qwen3-ASR vLLM model ready!")
+    return _qwen_vllm_model
+
+
+def normalize_qwen_language(language):
+    if not language or language == "auto":
+        return None
+    language_map = {
+        "zh": "Chinese",
+        "zh-cn": "Chinese",
+        "cn": "Chinese",
+        "中文": "Chinese",
+        "汉语": "Chinese",
+        "chinese": "Chinese",
+        "en": "English",
+        "english": "English",
+        "英文": "English",
+    }
+    return language_map.get(str(language).strip().lower(), language)
+
+
+def prepare_qwen_segments(audio_data, sr=16000, use_vad=True):
+    if sr != 16000:
+        import librosa
+        audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=16000)
+        sr = 16000
+
+    if audio_data.ndim > 1:
+        audio_data = audio_data[:, 0]
+    audio_data = audio_data.astype(np.float32)
+
+    if use_vad and len(audio_data) > sr * 1:
+        vad_res = _vad_model.generate(input=audio_data, fs=sr)
+        segments = vad_res[0]["value"]
+    else:
+        segments = [[0, int(len(audio_data) * 1000 / sr)]]
+
+    seg_audios = []
+    seg_times = []
+    for seg in segments or []:
+        s0 = int(seg[0] * sr / 1000)
+        s1 = int(seg[1] * sr / 1000)
+        seg_audio = audio_data[s0:s1]
+        if len(seg_audio) > sr * 0.3:
+            seg_audios.append(seg_audio)
+            seg_times.append((seg[0], seg[1]))
+    return audio_data, sr, seg_audios, seg_times
+
+
+def parse_qwen_time_stamp_item(ts):
+    """Normalize qwen-asr forced aligner timestamp items."""
+    if isinstance(ts, dict):
+        word = ts.get("text") or ts.get("word") or ts.get("token") or ""
+        ts_start = ts.get("start") or ts.get("start_time") or 0
+        ts_end = ts.get("end") or ts.get("end_time") or 0
+    elif isinstance(ts, (list, tuple)) and len(ts) >= 2:
+        word = ts[2] if len(ts) > 2 else ""
+        ts_start, ts_end = ts[0], ts[1]
+    elif all(hasattr(ts, name) for name in ("start_time", "end_time")):
+        word = getattr(ts, "text", "") or getattr(ts, "word", "") or getattr(ts, "token", "")
+        ts_start = getattr(ts, "start_time")
+        ts_end = getattr(ts, "end_time")
+    else:
+        return None
+    return {"word": str(word), "start": float(ts_start), "end": float(ts_end)}
 
 
 def process_audio(audio_data, sr=16000, language=None, hotwords=None, 
@@ -184,6 +311,166 @@ def process_audio(audio_data, sr=16000, language=None, hotwords=None,
     }
 
 
+def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None,
+                        use_vad=True, use_spk=False, use_timestamp=True):
+    """Core Qwen3-ASR processing: VAD segment → Qwen3-ASR batch → optional SPK."""
+    audio_data, sr, seg_audios, seg_times = prepare_qwen_segments(audio_data, sr, use_vad)
+
+    if not seg_audios:
+        return {"text": "", "segments": [], "duration": len(audio_data) / sr}
+
+    model = load_qwen_model()
+    gen_kwargs = {"language": normalize_qwen_language(language)}
+    if hotwords:
+        gen_kwargs["context"] = " ".join(hotwords)
+    gen_kwargs = {key: value for key, value in gen_kwargs.items() if value}
+    if use_timestamp:
+        gen_kwargs["output_timestamp"] = True
+
+    results = model.generate(input=seg_audios, **gen_kwargs)
+    output_segments = []
+    full_text_parts = []
+    for r, (start_ms, end_ms) in zip(results, seg_times):
+        text = truncate_repetition(str(r.get("text") or ""))
+        seg_info = {
+            "text": text,
+            "start": start_ms / 1000,
+            "end": end_ms / 1000,
+        }
+        if "timestamp" in r:
+            offset = start_ms / 1000
+            seg_info["words"] = [
+                {"start": ts[0] / 1000 + offset, "end": ts[1] / 1000 + offset}
+                for ts in r["timestamp"]
+            ]
+        output_segments.append(seg_info)
+        full_text_parts.append(text)
+
+    if use_spk and _spk_model is not None:
+        from funasr.models.campplus.utils import sv_chunk, postprocess, distribute_spk
+        from funasr.models.campplus.cluster_backend import ClusterBackend
+
+        vad_segs = [[st, et, audio_data[int(st*sr):int(et*sr)]]
+                    for st, et in [(s["start"], s["end"]) for s in output_segments]]
+        chunks = sv_chunk(vad_segs)
+        if chunks:
+            speech_list = [ch[2] for ch in chunks]
+            spk_res = _spk_model.generate(input=speech_list, cache={}, is_final=True)
+            embs = torch.cat([r["spk_embedding"] for r in spk_res], dim=0)
+            cluster = ClusterBackend(merge_thr=0.78).to(_args.device)
+            labels = cluster(embs.cpu(), oracle_num=None)
+            if not isinstance(labels, np.ndarray):
+                labels = np.array(labels)
+            all_sorted = sorted(chunks, key=lambda x: x[0])
+            sv_output = postprocess(all_sorted, None, labels, embs.cpu())
+            sentences = [{"text": s["text"], "start": int(s["start"]*1000), "end": int(s["end"]*1000)}
+                         for s in output_segments]
+            distribute_spk(sentences, sv_output)
+            for i, s in enumerate(sentences):
+                output_segments[i]["speaker"] = f"SPK{s.get('spk', 0)}"
+
+    return {
+        "text": " ".join(full_text_parts),
+        "segments": output_segments,
+        "duration": len(audio_data) / sr,
+    }
+
+
+def process_audio_qwen3_vllm(audio_data, sr=16000, language=None, hotwords=None,
+                             use_vad=True, use_spk=False, use_timestamp=True):
+    """Core Qwen3-ASR vLLM processing: VAD segment → qwen-asr vLLM batch → optional SPK."""
+    audio_data, sr, seg_audios, seg_times = prepare_qwen_segments(audio_data, sr, use_vad)
+
+    if not seg_audios:
+        return {"text": "", "segments": [], "duration": len(audio_data) / sr}
+
+    model = load_qwen_vllm_model()
+    qwen_language = normalize_qwen_language(language)
+    context = " ".join(hotwords) if hotwords else None
+    has_forced_aligner = bool(getattr(_args, "qwen_forced_aligner", "") or "")
+    results = model.transcribe(
+        audio=[(seg_audio, sr) for seg_audio in seg_audios],
+        language=qwen_language,
+        context=context,
+        return_time_stamps=bool(use_timestamp and has_forced_aligner),
+    )
+
+    output_segments = []
+    full_text_parts = []
+    for r, (start_ms, end_ms) in zip(results, seg_times):
+        text = truncate_repetition(str(getattr(r, "text", "") or ""))
+        seg_info = {
+            "text": text,
+            "start": start_ms / 1000,
+            "end": end_ms / 1000,
+        }
+        time_stamps = getattr(r, "time_stamps", None)
+        if use_timestamp and time_stamps:
+            offset = start_ms / 1000
+            words = []
+            for ts in time_stamps:
+                parsed = parse_qwen_time_stamp_item(ts)
+                if parsed is None:
+                    continue
+                words.append(
+                    {
+                        "word": parsed["word"],
+                        "start": parsed["start"] + offset,
+                        "end": parsed["end"] + offset,
+                    }
+                )
+            if words:
+                seg_info["words"] = words
+        output_segments.append(seg_info)
+        full_text_parts.append(text)
+
+    if use_spk and _spk_model is not None:
+        from funasr.models.campplus.utils import sv_chunk, postprocess, distribute_spk
+        from funasr.models.campplus.cluster_backend import ClusterBackend
+
+        vad_segs = [[st, et, audio_data[int(st*sr):int(et*sr)]]
+                    for st, et in [(s["start"], s["end"]) for s in output_segments]]
+        chunks = sv_chunk(vad_segs)
+        if chunks:
+            speech_list = [ch[2] for ch in chunks]
+            spk_res = _spk_model.generate(input=speech_list, cache={}, is_final=True)
+            embs = torch.cat([r["spk_embedding"] for r in spk_res], dim=0)
+            cluster = ClusterBackend(merge_thr=0.78).to(_args.device)
+            labels = cluster(embs.cpu(), oracle_num=None)
+            if not isinstance(labels, np.ndarray):
+                labels = np.array(labels)
+            all_sorted = sorted(chunks, key=lambda x: x[0])
+            sv_output = postprocess(all_sorted, None, labels, embs.cpu())
+            sentences = [{"text": s["text"], "start": int(s["start"]*1000), "end": int(s["end"]*1000)}
+                         for s in output_segments]
+            distribute_spk(sentences, sv_output)
+            for i, s in enumerate(sentences):
+                output_segments[i]["speaker"] = f"SPK{s.get('spk', 0)}"
+
+    return {
+        "text": " ".join(full_text_parts),
+        "segments": output_segments,
+        "duration": len(audio_data) / sr,
+    }
+
+
+def read_audio_upload(content, filename="audio"):
+    """Read uploaded audio bytes, falling back to librosa/ffmpeg-backed decoders."""
+    try:
+        return sf.read(io.BytesIO(content))
+    except Exception:
+        suffix = os.path.splitext(filename or "")[1] or ".audio"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+            tmp.write(content)
+            tmp.flush()
+            import librosa
+
+            audio_data, sr = librosa.load(tmp.name, sr=None, mono=False)
+        if isinstance(audio_data, np.ndarray) and audio_data.ndim > 1:
+            audio_data = audio_data.T
+        return audio_data, sr
+
+
 # ============================================================
 # FastAPI App
 # ============================================================
@@ -206,7 +493,7 @@ async def asr_endpoint(
 ):
     """ASR with file upload. Returns text + segments + timestamps + speaker."""
     content = await file.read()
-    audio_data, sr = sf.read(io.BytesIO(content))
+    audio_data, sr = read_audio_upload(content, file.filename)
 
     hw_list = [w.strip() for w in hotwords.split(",") if w.strip()] if hotwords else None
 
@@ -218,6 +505,97 @@ async def asr_endpoint(
     result["processing_time"] = round(t1 - t0, 3)
     result["rtf"] = round((t1 - t0) / result["duration"], 4) if result["duration"] > 0 else 0
     return JSONResponse(content=result)
+
+
+@app.post("/asr/batch")
+async def asr_batch_endpoint(
+    files: list[UploadFile] = File(...),
+    model: str = Form(default="fun-asr-nano-vllm"),
+    language: str = Form(default=None),
+    hotwords: str = Form(default=""),
+    speaker_diarization: bool = Form(default=True),
+    timestamps: bool = Form(default=True),
+    output_granularity: str = Form(default="sentence"),
+):
+    """Batch ASR with multiple file uploads in one request."""
+    if model not in SUPPORTED_BATCH_ROUTES:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"unsupported model route for this service: {model}",
+                "supported_routes": sorted(SUPPORTED_BATCH_ROUTES),
+            },
+        )
+
+    max_batch_size = getattr(_args, "max_batch_size", 8) if _args is not None else 8
+    if len(files) > max_batch_size:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"batch size {len(files)} exceeds max_batch_size {max_batch_size}",
+                "max_batch_size": max_batch_size,
+            },
+        )
+
+    hw_list = [w.strip() for w in hotwords.split(",") if w.strip()] if hotwords else None
+    results = []
+    batch_t0 = time.perf_counter()
+
+    for file in files:
+        item_t0 = time.perf_counter()
+        file_name = file.filename or "unknown"
+        try:
+            content = await file.read()
+            audio_data, sr = read_audio_upload(content, file_name)
+            if model in QWEN3_VLLM_BATCH_ROUTES:
+                processor = process_audio_qwen3_vllm
+            elif model in QWEN3_BATCH_ROUTES:
+                processor = process_audio_qwen3
+            else:
+                processor = process_audio
+            result = processor(
+                    audio_data,
+                    sr=sr,
+                    language=language or None,
+                    hotwords=hw_list,
+                    use_spk=speaker_diarization,
+                    use_timestamp=timestamps,
+                )
+            item_elapsed = time.perf_counter() - item_t0
+            result.update(
+                {
+                    "file_name": file_name,
+                    "status": "success",
+                    "model_path": (
+                        getattr(_args, "qwen_model", "Qwen/Qwen3-ASR-1.7B")
+                        if model in (QWEN3_BATCH_ROUTES | QWEN3_VLLM_BATCH_ROUTES)
+                        else getattr(_args, "model", "FunAudioLLM/Fun-ASR-Nano-2512")
+                    ),
+                    "processing_time": round(item_elapsed, 3),
+                    "rtf": round(item_elapsed / result["duration"], 4) if result.get("duration", 0) > 0 else 0,
+                }
+            )
+            results.append(result)
+        except Exception as exc:
+            logger.exception("Batch ASR failed for %s", file_name)
+            results.append(
+                {
+                    "file_name": file_name,
+                    "status": "failed",
+                    "error": str(exc),
+                    "processing_time": round(time.perf_counter() - item_t0, 3),
+                }
+            )
+
+    return JSONResponse(
+        content={
+            "model": model,
+            "batch_size": len(files),
+            "output_granularity": output_granularity,
+            "processing_time": round(time.perf_counter() - batch_t0, 3),
+            "results": results,
+        }
+    )
 
 
 # --- OpenAI API: POST /v1/audio/transcriptions ---
@@ -264,6 +642,8 @@ async def openai_transcriptions(
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """Streaming WebSocket ASR with dynamic VAD + SPK."""
+    from funasr.models.fsmn_vad_streaming.dynamic_vad import DynamicStreamingVAD
+
     await websocket.accept()
     logger.info(f"WebSocket connected: {websocket.client}")
 
@@ -402,11 +782,18 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--model", type=str, default="FunAudioLLM/Fun-ASR-Nano-2512")
+    parser.add_argument("--qwen-model", type=str, default="Qwen/Qwen3-ASR-1.7B")
+    parser.add_argument("--qwen-forced-aligner", type=str, default="", help="Optional Qwen3 forced aligner model for timestamp alignment")
+    parser.add_argument("--qwen-gpu-memory-utilization", type=float, default=None, help="Optional GPU memory utilization for the Qwen3-ASR vLLM engine")
+    parser.add_argument("--qwen-max-model-len", type=int, default=None, help="Optional max model length for the Qwen3-ASR vLLM engine")
+    parser.add_argument("--qwen-max-inference-batch-size", type=int, default=128)
+    parser.add_argument("--qwen-max-new-tokens", type=int, default=4096)
     parser.add_argument("--hub", type=str, default="ms")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--dtype", type=str, default="bf16")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--max-batch-size", type=int, default=8, help="Maximum files accepted by /asr/batch")
     parser.add_argument("--vad-model", type=str, default="fsmn-vad", help="VAD model name or local path")
     parser.add_argument("--spk-model", type=str, default="iic/speech_eres2netv2_sv_zh-cn_16k-common", help="Speaker model name or local path (set empty to disable)")
     _args = parser.parse_args()

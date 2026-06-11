@@ -124,7 +124,7 @@ setup(
     long_description=open(os.path.join(dirname, "README.md"), encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     license="The MIT License",
-    packages=find_packages(include=["funasr*"]),
+    packages=find_packages(include=["funasr*", "batch_transcriber*"]),
     package_data={"funasr": ["version.txt"]},
     install_requires=install_requires,
     setup_requires=setup_requires,
@@ -153,6 +153,8 @@ setup(
     entry_points={
         "console_scripts": [
             "funasr = funasr.cli:main",
+            "batch-transcribe = batch_transcriber.cli:main",
+            "batch-transcribe-download-models = batch_transcriber.download_models:main",
             "funasr-hydra = funasr.bin.inference:main_hydra",
             "funasr-server = funasr.bin.server:main",
             "funasr-train = funasr.bin.train:main_hydra",

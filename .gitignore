@@ -25,3 +25,12 @@ modelscope_models
 examples/aishell/llm_asr_nar/*
 *egg-info
 env/
+
+# Local batch transcription inputs and generated outputs.
+音频文件/
+听译结果/
+听译结果_*/
+*.m4a
+*.mp3
+*.wav
+*.flac
