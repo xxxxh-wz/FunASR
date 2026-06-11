@@ -67,6 +67,32 @@ NANO_BATCH_ROUTES = {"fun-asr-nano-vllm", "fun-asr-nano", "FunAudioLLM/Fun-ASR-N
 QWEN3_BATCH_ROUTES = {"qwen3-asr", "qwen3-asr-1.7b", "Qwen/Qwen3-ASR-1.7B"}
 QWEN3_VLLM_BATCH_ROUTES = {"qwen3-asr-vllm", "qwen3-asr-1.7b-vllm"}
 SUPPORTED_BATCH_ROUTES = NANO_BATCH_ROUTES | QWEN3_BATCH_ROUTES | QWEN3_VLLM_BATCH_ROUTES
+DEFAULT_HOTWORD_PROMPT_TEMPLATE = "以下是本段音频可能出现的专有名词、课程术语或人名，请在转写时优先参考：{hotwords}"
+
+
+def parse_hotwords(raw_hotwords):
+    if not raw_hotwords:
+        return None
+    parts = re.split(r"[,，、\n\r]+", str(raw_hotwords))
+    hotwords = []
+    seen = set()
+    for part in parts:
+        item = part.strip()
+        if not item or item.startswith("#") or item in seen:
+            continue
+        seen.add(item)
+        hotwords.append(item)
+    return hotwords or None
+
+
+def build_hotword_context(hotwords=None, template=None):
+    if not hotwords:
+        return None
+    text = "、".join(str(word).strip() for word in hotwords if str(word).strip())
+    if not text:
+        return None
+    prompt_template = template or DEFAULT_HOTWORD_PROMPT_TEMPLATE
+    return prompt_template.format(hotwords=text)
 
 
 def load_engine(args):
@@ -311,7 +337,7 @@ def process_audio(audio_data, sr=16000, language=None, hotwords=None,
     }
 
 
-def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None,
+def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None, hotword_prompt_template=None,
                         use_vad=True, use_spk=False, use_timestamp=True):
     """Core Qwen3-ASR processing: VAD segment → Qwen3-ASR batch → optional SPK."""
     audio_data, sr, seg_audios, seg_times = prepare_qwen_segments(audio_data, sr, use_vad)
@@ -322,7 +348,7 @@ def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None,
     model = load_qwen_model()
     gen_kwargs = {"language": normalize_qwen_language(language)}
     if hotwords:
-        gen_kwargs["context"] = " ".join(hotwords)
+        gen_kwargs["context"] = build_hotword_context(hotwords, hotword_prompt_template)
     gen_kwargs = {key: value for key, value in gen_kwargs.items() if value}
     if use_timestamp:
         gen_kwargs["output_timestamp"] = True
@@ -376,7 +402,7 @@ def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None,
     }
 
 
-def process_audio_qwen3_vllm(audio_data, sr=16000, language=None, hotwords=None,
+def process_audio_qwen3_vllm(audio_data, sr=16000, language=None, hotwords=None, hotword_prompt_template=None,
                              use_vad=True, use_spk=False, use_timestamp=True):
     """Core Qwen3-ASR vLLM processing: VAD segment → qwen-asr vLLM batch → optional SPK."""
     audio_data, sr, seg_audios, seg_times = prepare_qwen_segments(audio_data, sr, use_vad)
@@ -386,7 +412,7 @@ def process_audio_qwen3_vllm(audio_data, sr=16000, language=None, hotwords=None,
 
     model = load_qwen_vllm_model()
     qwen_language = normalize_qwen_language(language)
-    context = " ".join(hotwords) if hotwords else None
+    context = build_hotword_context(hotwords, hotword_prompt_template)
     has_forced_aligner = bool(getattr(_args, "qwen_forced_aligner", "") or "")
     results = model.transcribe(
         audio=[(seg_audio, sr) for seg_audio in seg_audios],
@@ -495,7 +521,7 @@ async def asr_endpoint(
     content = await file.read()
     audio_data, sr = read_audio_upload(content, file.filename)
 
-    hw_list = [w.strip() for w in hotwords.split(",") if w.strip()] if hotwords else None
+    hw_list = parse_hotwords(hotwords)
 
     t0 = time.perf_counter()
     result = process_audio(audio_data, sr=sr, language=language, 
@@ -513,6 +539,7 @@ async def asr_batch_endpoint(
     model: str = Form(default="fun-asr-nano-vllm"),
     language: str = Form(default=None),
     hotwords: str = Form(default=""),
+    hotword_prompt_template: str = Form(default=""),
     speaker_diarization: bool = Form(default=True),
     timestamps: bool = Form(default=True),
     output_granularity: str = Form(default="sentence"),
@@ -537,7 +564,9 @@ async def asr_batch_endpoint(
             },
         )
 
-    hw_list = [w.strip() for w in hotwords.split(",") if w.strip()] if hotwords else None
+    hw_list = parse_hotwords(hotwords)
+    hotwords_count = len(hw_list or [])
+    hotword_template = hotword_prompt_template or None
     results = []
     batch_t0 = time.perf_counter()
 
@@ -553,14 +582,19 @@ async def asr_batch_endpoint(
                 processor = process_audio_qwen3
             else:
                 processor = process_audio
+            processor_kwargs = {
+                "language": language or None,
+                "hotwords": hw_list,
+                "use_spk": speaker_diarization,
+                "use_timestamp": timestamps,
+            }
+            if processor in (process_audio_qwen3, process_audio_qwen3_vllm):
+                processor_kwargs["hotword_prompt_template"] = hotword_template
             result = processor(
-                    audio_data,
-                    sr=sr,
-                    language=language or None,
-                    hotwords=hw_list,
-                    use_spk=speaker_diarization,
-                    use_timestamp=timestamps,
-                )
+                audio_data,
+                sr=sr,
+                **processor_kwargs,
+            )
             item_elapsed = time.perf_counter() - item_t0
             result.update(
                 {
@@ -573,6 +607,8 @@ async def asr_batch_endpoint(
                     ),
                     "processing_time": round(item_elapsed, 3),
                     "rtf": round(item_elapsed / result["duration"], 4) if result.get("duration", 0) > 0 else 0,
+                    "hotwords_applied": hotwords_count > 0,
+                    "hotwords_count": hotwords_count,
                 }
             )
             results.append(result)
@@ -584,6 +620,8 @@ async def asr_batch_endpoint(
                     "status": "failed",
                     "error": str(exc),
                     "processing_time": round(time.perf_counter() - item_t0, 3),
+                    "hotwords_applied": hotwords_count > 0,
+                    "hotwords_count": hotwords_count,
                 }
             )
 
@@ -592,6 +630,8 @@ async def asr_batch_endpoint(
             "model": model,
             "batch_size": len(files),
             "output_granularity": output_granularity,
+            "hotwords_applied": hotwords_count > 0,
+            "hotwords_count": hotwords_count,
             "processing_time": round(time.perf_counter() - batch_t0, 3),
             "results": results,
         }

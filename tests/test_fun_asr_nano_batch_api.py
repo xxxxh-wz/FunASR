@@ -100,7 +100,16 @@ def test_asr_batch_routes_qwen3_asr_to_non_vllm_processor(monkeypatch):
     monkeypatch.setattr(module, "load_engine", lambda args: None)
     calls = {}
 
-    def fake_process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None, use_vad=True, use_spk=False, use_timestamp=True):
+    def fake_process_audio_qwen3(
+        audio_data,
+        sr=16000,
+        language=None,
+        hotwords=None,
+        hotword_prompt_template=None,
+        use_vad=True,
+        use_spk=False,
+        use_timestamp=True,
+    ):
         calls["language"] = language
         calls["use_spk"] = use_spk
         calls["use_timestamp"] = use_timestamp
@@ -132,12 +141,52 @@ def test_asr_batch_routes_qwen3_asr_to_non_vllm_processor(monkeypatch):
     assert calls == {"language": "中文", "use_spk": True, "use_timestamp": True}
 
 
+def test_qwen3_asr_uses_templated_hotword_context(monkeypatch):
+    module = _load_server_module()
+    module._args = type("Args", (), {})()
+    calls = {}
+
+    class FakeModel:
+        def generate(self, input, **kwargs):
+            calls["context"] = kwargs.get("context")
+            return [{"text": "qwen text"}]
+
+    monkeypatch.setattr(
+        module,
+        "prepare_qwen_segments",
+        lambda audio_data, sr=16000, use_vad=True: (
+            np.zeros(16000, dtype=np.float32),
+            16000,
+            [np.zeros(16000, dtype=np.float32)],
+            [(0, 1000)],
+        ),
+    )
+    monkeypatch.setattr(module, "load_qwen_model", lambda: FakeModel())
+
+    module.process_audio_qwen3(
+        np.zeros(16000, dtype=np.float32),
+        sr=16000,
+        hotwords=["线性映射", "矩阵表示"],
+    )
+
+    assert calls["context"] == "以下是本段音频可能出现的专有名词、课程术语或人名，请在转写时优先参考：线性映射、矩阵表示"
+
+
 def test_asr_batch_routes_qwen3_asr_vllm_to_vllm_processor(monkeypatch):
     module = _load_server_module()
     monkeypatch.setattr(module, "load_engine", lambda args: None)
     calls = {}
 
-    def fake_process_audio_qwen3_vllm(audio_data, sr=16000, language=None, hotwords=None, use_vad=True, use_spk=False, use_timestamp=True):
+    def fake_process_audio_qwen3_vllm(
+        audio_data,
+        sr=16000,
+        language=None,
+        hotwords=None,
+        hotword_prompt_template=None,
+        use_vad=True,
+        use_spk=False,
+        use_timestamp=True,
+    ):
         calls["language"] = language
         calls["hotwords"] = hotwords
         calls["use_spk"] = use_spk
@@ -173,6 +222,46 @@ def test_asr_batch_routes_qwen3_asr_vllm_to_vllm_processor(monkeypatch):
         "use_spk": False,
         "use_timestamp": True,
     }
+    assert payload["hotwords_applied"] is True
+    assert payload["hotwords_count"] == 2
+    assert payload["results"][0]["hotwords_applied"] is True
+    assert payload["results"][0]["hotwords_count"] == 2
+
+
+def test_qwen3_vllm_uses_templated_hotword_context(monkeypatch):
+    module = _load_server_module()
+    module._args = type("Args", (), {"qwen_forced_aligner": ""})()
+    calls = {}
+
+    @dataclass
+    class FakeTranscription:
+        text: str
+        time_stamps: None = None
+
+    class FakeModel:
+        def transcribe(self, **kwargs):
+            calls["context"] = kwargs.get("context")
+            return [FakeTranscription("qwen text")]
+
+    monkeypatch.setattr(
+        module,
+        "prepare_qwen_segments",
+        lambda audio_data, sr=16000, use_vad=True: (
+            np.zeros(16000, dtype=np.float32),
+            16000,
+            [np.zeros(16000, dtype=np.float32)],
+            [(0, 1000)],
+        ),
+    )
+    monkeypatch.setattr(module, "load_qwen_vllm_model", lambda: FakeModel())
+
+    module.process_audio_qwen3_vllm(
+        np.zeros(16000, dtype=np.float32),
+        sr=16000,
+        hotwords=["线性映射", "矩阵表示"],
+    )
+
+    assert calls["context"] == "以下是本段音频可能出现的专有名词、课程术语或人名，请在转写时优先参考：线性映射、矩阵表示"
 
 
 def test_qwen3_vllm_forced_aligner_items_are_mapped_to_words(monkeypatch):

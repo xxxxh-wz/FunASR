@@ -24,6 +24,8 @@ class BatchTranscriptionClient:
         language: str,
         timestamps: bool = True,
         speaker_diarization: bool = True,
+        hotwords: tuple[str, ...] | list[str] = (),
+        hotword_prompt_template: str | None = None,
     ) -> dict[str, Any]:
         url = f"{self.server_url}/asr/batch"
         handles = []
@@ -39,7 +41,10 @@ class BatchTranscriptionClient:
                 "timestamps": str(timestamps).lower(),
                 "speaker_diarization": str(speaker_diarization).lower(),
                 "output_granularity": "sentence",
+                "hotwords": ",".join(hotwords),
             }
+            if hotword_prompt_template:
+                data["hotword_prompt_template"] = hotword_prompt_template
             response = requests.post(url, files=files, data=data, timeout=self.timeout_seconds)
             if response.status_code == 404:
                 raise BatchEndpointUnavailable(

@@ -10,6 +10,7 @@ from typing import Any
 from batch_transcriber.client import BatchTranscriptionClient, result_key
 from batch_transcriber.config import BatchConfig
 from batch_transcriber.formatter import atomic_write, render_json, render_markdown, render_srt
+from batch_transcriber.hotwords import load_hotwords
 from batch_transcriber.scanner import AudioTask, chunk_tasks, discover_audio_files
 
 
@@ -102,6 +103,12 @@ def _match_results(tasks: list[AudioTask], payload: dict[str, Any]) -> dict[str,
 
 def run(config: BatchConfig, client: BatchTranscriptionClient | None = None) -> RunSummary:
     config.validate()
+    hotwords = load_hotwords(
+        config.hotwords,
+        hotword_file=config.hotword_file,
+        max_hotwords=config.max_hotwords,
+        max_hotword_chars=config.max_hotword_chars,
+    )
     if config.retry_failed:
         discovered = _load_retry_failed_tasks(config)
     else:
@@ -118,6 +125,8 @@ def run(config: BatchConfig, client: BatchTranscriptionClient | None = None) -> 
     benchmark_path = config.output_dir / "benchmark_results.jsonl"
 
     batches = chunk_tasks(discovered, config.batch_size)
+    print(f"Route: {config.route}")
+    print(f"Hotwords: {'enabled, ' + str(len(hotwords)) + ' terms' if hotwords else 'disabled'}")
     started = time.perf_counter()
     for batch_index, batch in enumerate(batches, 1):
         batch_start = time.perf_counter()
@@ -132,6 +141,8 @@ def run(config: BatchConfig, client: BatchTranscriptionClient | None = None) -> 
                     language=config.language,
                     timestamps=config.timestamps,
                     speaker_diarization=config.speaker_diarization,
+                    hotwords=hotwords,
+                    hotword_prompt_template=config.hotword_prompt_template,
                 )
                 break
             except Exception as exc:  # noqa: BLE001 - keep CLI robust and record exact failure
@@ -179,6 +190,7 @@ def run(config: BatchConfig, client: BatchTranscriptionClient | None = None) -> 
                 "batch_size": len(batch),
                 "elapsed_seconds": round(elapsed, 3),
                 "server_url": config.server_url,
+                "hotwords_count": len(hotwords),
                 "time": datetime.now(timezone.utc).isoformat(),
             },
         )

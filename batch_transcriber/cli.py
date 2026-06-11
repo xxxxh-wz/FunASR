@@ -35,6 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-merge-gap-seconds", type=float, default=None)
     parser.add_argument("--min-speaker-turn-seconds", type=float, default=None)
     parser.add_argument("--drop-filler-only-segments", action="store_true", default=None)
+    parser.add_argument("--hotwords", default=None)
+    parser.add_argument("--hotword-file", default=None)
+    parser.add_argument("--max-hotwords", type=int, default=None)
+    parser.add_argument("--max-hotword-chars", type=int, default=None)
     return parser
 
 
@@ -43,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     config = BatchConfig.from_yaml(args.config) if args.config else BatchConfig()
     overrides = vars(args).copy()
     overrides.pop("config", None)
-    for key in ("input_dir", "output_dir"):
+    for key in ("input_dir", "output_dir", "hotword_file"):
         if overrides.get(key) is not None:
             overrides[key] = Path(overrides[key])
     config = config.with_overrides(**overrides)

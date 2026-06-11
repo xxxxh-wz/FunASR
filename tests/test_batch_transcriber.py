@@ -5,6 +5,7 @@ import pytest
 
 from batch_transcriber.config import BatchConfig
 from batch_transcriber.formatter import postprocess_segments, render_markdown, render_srt
+from batch_transcriber.hotwords import load_hotwords, normalize_hotwords
 from batch_transcriber.runner import run
 from batch_transcriber.scanner import AudioTask, discover_audio_files
 from batch_transcriber.client import BatchEndpointUnavailable, BatchTranscriptionClient
@@ -139,13 +140,58 @@ def test_postprocess_does_not_merge_across_large_silence_gap():
     assert "这里开始讲正文" in segments[0]["text"]
 
 
+def test_hotwords_normalize_deduplicates_and_limits():
+    hotwords = normalize_hotwords(
+        [" 线性映射,矩阵表示、特征值 ", "矩阵表示", "# comment", "", "x" * 65],
+        max_hotwords=3,
+        max_hotword_chars=64,
+    )
+
+    assert hotwords == ("线性映射", "矩阵表示", "特征值")
+    assert normalize_hotwords("线性映射", max_hotwords=0) == ()
+
+
+def test_load_hotwords_from_file_and_inline_sources(tmp_path):
+    hotword_file = tmp_path / "hotwords.txt"
+    hotword_file.write_text(
+        "\n".join(
+            [
+                "# course terms",
+                "线性映射",
+                "矩阵表示、特征值",
+                "",
+                "线性映射",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    hotwords = load_hotwords(["矩阵表示,特征向量"], hotword_file=hotword_file)
+
+    assert hotwords == ("矩阵表示", "特征向量", "线性映射", "特征值")
+
+
 class FakeClient:
     def __init__(self, payloads):
         self.payloads = list(payloads)
         self.calls = []
 
-    def transcribe_batch(self, tasks, route, language, timestamps=True, speaker_diarization=True):
-        self.calls.append([task.relative_path.as_posix() for task in tasks])
+    def transcribe_batch(
+        self,
+        tasks,
+        route,
+        language,
+        timestamps=True,
+        speaker_diarization=True,
+        hotwords=(),
+        hotword_prompt_template=None,
+    ):
+        self.calls.append(
+            {
+                "files": [task.relative_path.as_posix() for task in tasks],
+                "hotwords": tuple(hotwords),
+            }
+        )
         payload = self.payloads.pop(0)
         if isinstance(payload, Exception):
             raise payload
@@ -191,7 +237,8 @@ def test_runner_batches_writes_outputs_and_failed_jsonl(tmp_path):
     failed = (output_dir / "failed_files.jsonl").read_text(encoding="utf-8")
     assert "decode failed" in failed
     assert "CUDA out of memory" in failed
-    assert client.calls == [["a.wav", "c.wav"], ["nested/b.wav"]]
+    assert [call["files"] for call in client.calls] == [["a.wav", "c.wav"], ["nested/b.wav"]]
+    assert [call["hotwords"] for call in client.calls] == [(), ()]
 
 
 def test_runner_retry_failed_only_processes_failed_list(tmp_path):
@@ -233,9 +280,57 @@ def test_runner_retry_failed_only_processes_failed_list(tmp_path):
 
     assert summary.total == 1
     assert summary.success == 1
-    assert client.calls == [["failed.wav"]]
+    assert client.calls == [{"files": ["failed.wav"], "hotwords": ()}]
     assert (output_dir / "failed.md").exists()
     assert not (output_dir / "other.md").exists()
+
+
+def test_runner_passes_hotwords_and_writes_metadata(tmp_path):
+    input_dir = tmp_path / "音频文件"
+    output_dir = tmp_path / "听译结果"
+    audio = input_dir / "lecture.wav"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"audio")
+    hotword_file = tmp_path / "hotwords.txt"
+    hotword_file.write_text("矩阵表示\n特征值\n", encoding="utf-8")
+
+    client = FakeClient(
+        [
+            {
+                "results": [
+                    {
+                        "file_name": "lecture.wav",
+                        "status": "success",
+                        "duration": 1,
+                        "hotwords_applied": True,
+                        "hotwords_count": 3,
+                        "segments": [{"start": 0, "end": 1, "text": "ok"}],
+                    }
+                ]
+            }
+        ]
+    )
+
+    config = BatchConfig(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        hotwords=("线性映射,矩阵表示",),
+        hotword_file=hotword_file,
+    )
+
+    summary = run(config, client=client)
+    md = (output_dir / "lecture.md").read_text(encoding="utf-8")
+    payload = json.loads((output_dir / "lecture.json").read_text(encoding="utf-8"))
+    srt = (output_dir / "lecture.srt").read_text(encoding="utf-8")
+
+    assert summary.success == 1
+    assert client.calls == [{"files": ["lecture.wav"], "hotwords": ("线性映射", "矩阵表示", "特征值")}]
+    assert "- 热词：已启用，3 个" in md
+    assert "线性映射" not in md
+    assert payload["hotwords_applied"] is True
+    assert payload["hotwords_count"] == 3
+    assert "hotwords" not in payload
+    assert "热词" not in srt
 
 
 def test_client_reports_missing_batch_endpoint(monkeypatch, tmp_path):
@@ -262,6 +357,43 @@ def test_client_reports_missing_batch_endpoint(monkeypatch, tmp_path):
 
     with pytest.raises(BatchEndpointUnavailable, match="/asr/batch"):
         BatchTranscriptionClient("http://127.0.0.1:8000").transcribe_batch([task], "fun-asr-nano-vllm", "auto")
+
+
+def test_client_posts_hotwords(monkeypatch, tmp_path):
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"audio")
+    task = AudioTask(
+        source_path=audio,
+        relative_path=Path("a.wav"),
+        output_md=tmp_path / "a.md",
+        output_srt=tmp_path / "a.srt",
+        output_json=tmp_path / "a.json",
+    )
+    calls = {}
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": []}
+
+    def fake_post(url, files, data, timeout):
+        calls["data"] = data
+        return Response()
+
+    monkeypatch.setattr("batch_transcriber.client.requests.post", fake_post)
+
+    BatchTranscriptionClient("http://127.0.0.1:8000").transcribe_batch(
+        [task],
+        "qwen3-asr-vllm",
+        "auto",
+        hotwords=("线性映射", "矩阵表示"),
+    )
+
+    assert calls["data"]["hotwords"] == "线性映射,矩阵表示"
 
 
 def test_config_rejects_translation():

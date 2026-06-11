@@ -223,6 +223,12 @@ def _postprocess_config(config: BatchConfig | None) -> dict[str, Any]:
     }
 
 
+def _hotword_metadata(result: dict[str, Any]) -> dict[str, Any]:
+    count = int(result.get("hotwords_count") or 0)
+    applied = bool(result.get("hotwords_applied")) or count > 0
+    return {"hotwords_applied": applied, "hotwords_count": count}
+
+
 def processed_segments(result: dict[str, Any], config: BatchConfig | None = None) -> list[dict[str, Any]]:
     options = _postprocess_config(config)
     return postprocess_segments(
@@ -248,6 +254,12 @@ def render_markdown(
     title = task.source_path.stem
     segments = processed_segments(result, config)
     generated = (started_at or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    hotword_meta = _hotword_metadata(result)
+    hotword_line = (
+        f"- 热词：已启用，{hotword_meta['hotwords_count']} 个"
+        if hotword_meta["hotwords_applied"]
+        else "- 热词：未启用"
+    )
     lines = [
         f"# {title}",
         "",
@@ -258,6 +270,7 @@ def render_markdown(
         f"- 语言：{language or 'auto'}",
         "- 是否翻译：否",
         "- VAD：服务端开启",
+        hotword_line,
         "- 时间戳粒度：句级",
         f"- 多说话人：{'开启' if any(s['speaker'] for s in segments) else '未返回'}",
         f"- 音频时长：{format_duration(result.get('duration'))}",
@@ -304,6 +317,7 @@ def render_srt(result: dict[str, Any], config: BatchConfig | None = None) -> str
 
 
 def render_json(task: AudioTask, result: dict[str, Any], route: str, language: str, config: BatchConfig | None = None) -> str:
+    hotword_meta = _hotword_metadata(result)
     payload = {
         "source_file": str(task.source_path),
         "output_md": str(task.output_md),
@@ -311,6 +325,8 @@ def render_json(task: AudioTask, result: dict[str, Any], route: str, language: s
         "route": route,
         "language": language or "auto",
         "translate": False,
+        "hotwords_applied": hotword_meta["hotwords_applied"],
+        "hotwords_count": hotword_meta["hotwords_count"],
         "postprocess_config": _postprocess_config(config),
         "postprocessed_segments": processed_segments(result, config),
         "result": result,

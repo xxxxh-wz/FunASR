@@ -51,6 +51,11 @@ class BatchConfig:
     max_merge_gap_seconds: float = 8.0
     min_speaker_turn_seconds: float = 8.0
     drop_filler_only_segments: bool = False
+    hotwords: tuple[str, ...] = ()
+    hotword_file: Path | None = None
+    max_hotwords: int = 200
+    max_hotword_chars: int = 64
+    hotword_prompt_template: str | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "BatchConfig":
@@ -60,9 +65,12 @@ class BatchConfig:
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "BatchConfig":
         normalized = dict(data)
-        for key in ("input_dir", "output_dir", "model_cache_dir"):
+        for key in ("input_dir", "output_dir", "model_cache_dir", "hotword_file"):
             if key in normalized and normalized[key] is not None:
                 normalized[key] = Path(normalized[key])
+        if "hotwords" in normalized and normalized["hotwords"] is not None:
+            value = normalized["hotwords"]
+            normalized["hotwords"] = (value,) if isinstance(value, str) else tuple(value)
         if "audio_extensions" in normalized and normalized["audio_extensions"] is not None:
             normalized["audio_extensions"] = tuple(
                 ext.lower() if str(ext).startswith(".") else f".{str(ext).lower()}"
@@ -72,9 +80,12 @@ class BatchConfig:
 
     def with_overrides(self, **kwargs: Any) -> "BatchConfig":
         cleaned = {k: v for k, v in kwargs.items() if v is not None}
-        for key in ("input_dir", "output_dir", "model_cache_dir"):
+        for key in ("input_dir", "output_dir", "model_cache_dir", "hotword_file"):
             if key in cleaned:
                 cleaned[key] = Path(cleaned[key])
+        if "hotwords" in cleaned and cleaned["hotwords"] is not None:
+            value = cleaned["hotwords"]
+            cleaned["hotwords"] = (value,) if isinstance(value, str) else tuple(value)
         return replace(self, **cleaned)
 
     def validate(self) -> None:
@@ -98,3 +109,7 @@ class BatchConfig:
             raise ValueError("max_merge_gap_seconds must be >= 0")
         if self.min_speaker_turn_seconds < 0:
             raise ValueError("min_speaker_turn_seconds must be >= 0")
+        if self.max_hotwords < 0:
+            raise ValueError("max_hotwords must be >= 0")
+        if self.max_hotword_chars <= 0:
+            raise ValueError("max_hotword_chars must be > 0")
