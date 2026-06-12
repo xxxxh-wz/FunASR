@@ -13,6 +13,8 @@ def test_asr_dockerfile_uses_uv_and_server_entrypoint():
     assert "uv sync --frozen" in dockerfile
     assert "examples/industrial_data_pretraining/fun_asr_nano/serve_vllm.py" in dockerfile
     assert "HEALTHCHECK" in dockerfile
+    assert "--timeout=15s" in dockerfile
+    assert "timeout=10" in dockerfile
     assert "/healthz" in dockerfile
 
 
@@ -29,6 +31,8 @@ def test_asr_compose_mounts_models_audio_outputs_and_gpu():
     assert "--qwen-model" in command
     assert "/models/Qwen/Qwen3-ASR-1___7B" in command
     assert "--qwen-gpu-memory-utilization" in command
+    assert "--preload-models" in command
+    assert "${FUNASR_PRELOAD_MODELS:-}" in command
     gpu_device = service["deploy"]["resources"]["reservations"]["devices"][0]
     assert gpu_device["device_ids"] == ["${FUNASR_GPU_DEVICE:-0}"]
     assert gpu_device["capabilities"] == ["gpu"]

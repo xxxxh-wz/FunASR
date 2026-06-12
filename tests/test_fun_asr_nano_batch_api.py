@@ -66,6 +66,50 @@ def test_healthz_reports_supported_routes_and_model_state(monkeypatch):
         "spk": False,
     }
     assert payload["model_paths"]["qwen3_asr"] == "/models/qwen"
+    assert payload["model_load_status"]["qwen3_asr_vllm"]["status"] == "loaded"
+
+
+def test_healthz_reports_model_loading_state(monkeypatch):
+    module = _load_server_module()
+    module._model_load_state["qwen3_asr_vllm"].update(
+        {"status": "loading", "started_at": 10.0, "ended_at": None, "error": None}
+    )
+
+    payload = module.asyncio.run(module.healthz())
+
+    assert payload["status"] == "loading"
+    assert payload["loading_model"] == "qwen3_asr_vllm"
+    assert payload["model_load_status"]["qwen3_asr_vllm"]["status"] == "loading"
+
+
+def test_model_load_endpoint_loads_qwen3_vllm(monkeypatch):
+    module = _load_server_module()
+    calls = []
+
+    def fake_load_qwen_vllm_model():
+        calls.append("qwen")
+        module._qwen_vllm_model = object()
+        return module._qwen_vllm_model
+
+    monkeypatch.setattr(module, "load_qwen_vllm_model", fake_load_qwen_vllm_model)
+
+    response = module.asyncio.run(module.load_model_endpoint("qwen3-asr-vllm", background=False))
+
+    assert response.status_code == 200
+    payload = _json_response_payload(response)
+    assert payload["status"] == "loaded"
+    assert payload["route"] == "qwen3-asr-vllm"
+    assert calls == ["qwen"]
+
+
+def test_preload_models_loads_requested_routes(monkeypatch):
+    module = _load_server_module()
+    calls = []
+    monkeypatch.setattr(module, "load_model_for_route", lambda route: calls.append(route))
+
+    module.preload_models("qwen3-asr-vllm, fun-asr-nano-vllm")
+
+    assert calls == ["qwen3-asr-vllm", "fun-asr-nano-vllm"]
 
 
 def test_asr_batch_returns_per_file_results(monkeypatch, tmp_path):

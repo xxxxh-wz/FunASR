@@ -55,5 +55,7 @@ services:
       - "16"
       - --qwen-max-new-tokens
       - "1024"
+      - --preload-models
+      - "${FUNASR_PRELOAD_MODELS:-}"
       - --max-batch-size
       - "8"

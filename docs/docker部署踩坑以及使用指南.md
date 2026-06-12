@@ -133,6 +133,28 @@ curl http://127.0.0.1:8903/healthz
 
 - `qwen3-asr-vllm` 是懒加载。服务启动健康后，第一次请求该 route 时才加载 Qwen3-ASR vLLM engine。
 - 第一次 Qwen 请求会比后续请求慢，接口调用方需要给首个请求更长超时时间。
+- 新版服务会在 `/healthz` 的 `model_load_status` 中暴露模型加载状态。加载中时 `status` 会返回 `loading`，并给出 `loading_model`。
+- 推荐在业务流量进入前显式预热 Qwen route，而不是让第一个字幕请求承担冷启动。
+
+显式预热：
+
+```bash
+curl -X POST "http://127.0.0.1:8903/models/qwen3-asr-vllm/load?background=false"
+curl http://127.0.0.1:8903/healthz
+```
+
+后台触发预热：
+
+```bash
+curl -X POST http://127.0.0.1:8903/models/qwen3-asr-vllm/load
+```
+
+Docker 启动时预加载：
+
+```bash
+FUNASR_HOST_PORT=8903 FUNASR_GPU_DEVICE=3 FUNASR_PRELOAD_MODELS=qwen3-asr-vllm \
+docker compose -f docker-compose.asr.yml up -d --force-recreate --no-build asr-server
+```
 
 ## 5. 字幕生成 API
 
@@ -381,6 +403,20 @@ model_path = /models/iic/speech_eres2netv2_sv_zh-cn_16k-common
 - 健康检查通过不代表 Qwen engine 已经加载。
 - 首次请求建议设置较长超时，例如 30 分钟。
 - 后续 warm 请求耗时会明显下降。
+- 如果业务侧直接用首个 `/asr/subtitles` 请求触发 Qwen 冷启动，可能出现长时间无输出、客户端超时后服务端才完成加载的体验。
+- 推荐部署后调用 `POST /models/qwen3-asr-vllm/load?background=false` 完成预热，或设置 `FUNASR_PRELOAD_MODELS=qwen3-asr-vllm` 让容器启动阶段预加载。
+- Docker 健康检查只判断 HTTP 服务是否可响应，不代表所有懒加载模型都 ready。以 `/healthz.model_load_status.qwen3_asr_vllm.status == "loaded"` 作为 Qwen ready 判据。
+
+若观察到显存已占用、GPU 利用率为 0、CPU 单进程约 100%，通常表示服务卡在 CPU 侧的加载、调度、VAD/音频处理或 Python 后处理阶段，而不是 CUDA kernel 正在运行。此时优先查看：
+
+```bash
+docker logs --tail 500 funasr-asr-server-1
+docker stats --no-stream funasr-asr-server-1
+nvidia-smi
+curl --max-time 10 http://127.0.0.1:8903/healthz
+```
+
+如果容器 `Up` 但 `/healthz` 连接拒绝或持续超时，应先重启服务，并用预热接口确认 Qwen 已加载后再放业务流量。
 
 ### 9.6 显存参数需要按服务形态调整
 

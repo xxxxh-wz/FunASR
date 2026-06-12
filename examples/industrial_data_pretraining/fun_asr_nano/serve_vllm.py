@@ -22,6 +22,7 @@ import os
 import re
 import time
 import tempfile
+import threading
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -65,6 +66,13 @@ _qwen_vllm_model = None
 _vad_model = None
 _spk_model = None
 _args = None
+_model_load_lock = threading.Lock()
+_model_init_lock = threading.Lock()
+_model_load_state = {
+    "fun_asr_nano_vllm": {"status": "unloaded", "started_at": None, "ended_at": None, "error": None},
+    "qwen3_asr": {"status": "unloaded", "started_at": None, "ended_at": None, "error": None},
+    "qwen3_asr_vllm": {"status": "unloaded", "started_at": None, "ended_at": None, "error": None},
+}
 NANO_BATCH_ROUTES = {"fun-asr-nano-vllm", "fun-asr-nano", "FunAudioLLM/Fun-ASR-Nano-2512"}
 QWEN3_BATCH_ROUTES = {"qwen3-asr", "qwen3-asr-1.7b", "Qwen/Qwen3-ASR-1.7B"}
 QWEN3_VLLM_BATCH_ROUTES = {"qwen3-asr-vllm", "qwen3-asr-1.7b-vllm"}
@@ -97,6 +105,58 @@ def build_hotword_context(hotwords=None, template=None):
     return prompt_template.format(hotwords=text)
 
 
+def route_state_key(model):
+    if model in QWEN3_VLLM_BATCH_ROUTES:
+        return "qwen3_asr_vllm"
+    if model in QWEN3_BATCH_ROUTES:
+        return "qwen3_asr"
+    if model in NANO_BATCH_ROUTES:
+        return "fun_asr_nano_vllm"
+    return None
+
+
+def set_model_load_state(key, status, *, error=None):
+    now = time.time()
+    with _model_load_lock:
+        state = _model_load_state.setdefault(
+            key,
+            {"status": "unloaded", "started_at": None, "ended_at": None, "error": None},
+        )
+        if status == "loading":
+            state.update({"status": status, "started_at": now, "ended_at": None, "error": None})
+        elif status in {"loaded", "failed"}:
+            state.update({"status": status, "ended_at": now, "error": error})
+            if state.get("started_at") is None:
+                state["started_at"] = now
+        else:
+            state.update({"status": status, "error": error})
+
+
+def model_load_status_payload():
+    with _model_load_lock:
+        status = {
+            key: {
+                "status": value.get("status"),
+                "started_at": value.get("started_at"),
+                "ended_at": value.get("ended_at"),
+                "elapsed_seconds": (
+                    round((value.get("ended_at") or time.time()) - value["started_at"], 3)
+                    if value.get("started_at") else None
+                ),
+                "error": value.get("error"),
+            }
+            for key, value in _model_load_state.items()
+        }
+
+    if _engine is not None:
+        status["fun_asr_nano_vllm"]["status"] = "loaded"
+    if _qwen_model is not None:
+        status["qwen3_asr"]["status"] = "loaded"
+    if _qwen_vllm_model is not None:
+        status["qwen3_asr_vllm"]["status"] = "loaded"
+    return status
+
+
 def spk_model_kwargs(spk_model, device):
     kwargs = {"model": spk_model, "device": device, "disable_update": True}
     if spk_model and os.path.exists(spk_model):
@@ -106,8 +166,11 @@ def spk_model_kwargs(spk_model, device):
 
 
 def health_payload():
+    load_status = model_load_status_payload()
+    loading_models = [key for key, value in load_status.items() if value.get("status") == "loading"]
     return {
-        "status": "ok",
+        "status": "loading" if loading_models else "ok",
+        "loading_model": loading_models[0] if loading_models else None,
         "supported_routes": sorted(SUPPORTED_BATCH_ROUTES),
         "models_loaded": {
             "fun_asr_nano_vllm": _engine is not None,
@@ -122,6 +185,7 @@ def health_payload():
             "vad": getattr(_args, "vad_model", None) if _args is not None else None,
             "spk": getattr(_args, "spk_model", None) if _args is not None else None,
         },
+        "model_load_status": load_status,
     }
 
 
@@ -134,20 +198,26 @@ def load_engine(args):
         from funasr import AutoModel
         from funasr.models.fun_asr_nano.inference_vllm import FunASRNanoVLLM
 
-        logger.info(f"Loading vLLM engine: {args.model}")
-        _engine = FunASRNanoVLLM.from_pretrained(
-            model=args.model, hub=args.hub, device=args.device, dtype=args.dtype,
-            max_model_len=args.max_model_len,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-        )
-        logger.info(f"Loading VAD: {args.vad_model}")
-        _vad_model = AutoModel(model=args.vad_model, device=args.device, disable_update=True)
-        if args.spk_model:
-            logger.info(f"Loading SPK: {args.spk_model}")
-            _spk_model = AutoModel(**spk_model_kwargs(args.spk_model, args.device))
-        else:
-            logger.info("SPK disabled")
-        logger.info("All models ready!")
+        set_model_load_state("fun_asr_nano_vllm", "loading")
+        try:
+            logger.info(f"Loading vLLM engine: {args.model}")
+            _engine = FunASRNanoVLLM.from_pretrained(
+                model=args.model, hub=args.hub, device=args.device, dtype=args.dtype,
+                max_model_len=args.max_model_len,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+            )
+            logger.info(f"Loading VAD: {args.vad_model}")
+            _vad_model = AutoModel(model=args.vad_model, device=args.device, disable_update=True)
+            if args.spk_model:
+                logger.info(f"Loading SPK: {args.spk_model}")
+                _spk_model = AutoModel(**spk_model_kwargs(args.spk_model, args.device))
+            else:
+                logger.info("SPK disabled")
+            set_model_load_state("fun_asr_nano_vllm", "loaded")
+            logger.info("All models ready!")
+        except Exception as exc:
+            set_model_load_state("fun_asr_nano_vllm", "failed", error=str(exc))
+            raise
 
 
 def load_qwen_model():
@@ -157,21 +227,27 @@ def load_qwen_model():
             raise RuntimeError("server args are not initialized")
         from funasr import AutoModel
 
-        logger.info(f"Loading Qwen3-ASR model: {_args.qwen_model}")
-        qwen_kwargs = {
-            "model": _args.qwen_model,
-            "hub": _args.hub,
-            "device": _args.device,
-            "dtype": _args.dtype,
-            "disable_update": True,
-        }
-        if os.path.exists(_args.qwen_model):
-            qwen_kwargs["model"] = "Qwen/Qwen3-ASR-1.7B"
-            qwen_kwargs["model_path"] = _args.qwen_model
-        _qwen_model = AutoModel(
-            **qwen_kwargs,
-        )
-        logger.info("Qwen3-ASR model ready!")
+        set_model_load_state("qwen3_asr", "loading")
+        try:
+            logger.info(f"Loading Qwen3-ASR model: {_args.qwen_model}")
+            qwen_kwargs = {
+                "model": _args.qwen_model,
+                "hub": _args.hub,
+                "device": _args.device,
+                "dtype": _args.dtype,
+                "disable_update": True,
+            }
+            if os.path.exists(_args.qwen_model):
+                qwen_kwargs["model"] = "Qwen/Qwen3-ASR-1.7B"
+                qwen_kwargs["model_path"] = _args.qwen_model
+            _qwen_model = AutoModel(
+                **qwen_kwargs,
+            )
+            set_model_load_state("qwen3_asr", "loaded")
+            logger.info("Qwen3-ASR model ready!")
+        except Exception as exc:
+            set_model_load_state("qwen3_asr", "failed", error=str(exc))
+            raise
     return _qwen_model
 
 
@@ -182,28 +258,34 @@ def load_qwen_vllm_model():
             raise RuntimeError("server args are not initialized")
         from qwen_asr import Qwen3ASRModel
 
-        logger.info(f"Loading Qwen3-ASR vLLM model: {_args.qwen_model}")
-        forced_aligner = getattr(_args, "qwen_forced_aligner", "") or None
-        forced_aligner_kwargs = None
-        if forced_aligner:
-            forced_aligner_kwargs = {
-                "dtype": getattr(torch, str(_args.dtype).replace("bf16", "bfloat16"), torch.bfloat16),
-                "device_map": _args.device,
+        set_model_load_state("qwen3_asr_vllm", "loading")
+        try:
+            logger.info(f"Loading Qwen3-ASR vLLM model: {_args.qwen_model}")
+            forced_aligner = getattr(_args, "qwen_forced_aligner", "") or None
+            forced_aligner_kwargs = None
+            if forced_aligner:
+                forced_aligner_kwargs = {
+                    "dtype": getattr(torch, str(_args.dtype).replace("bf16", "bfloat16"), torch.bfloat16),
+                    "device_map": _args.device,
+                }
+            qwen_kwargs = {
+                "model": _args.qwen_model,
+                "gpu_memory_utilization": getattr(_args, "qwen_gpu_memory_utilization", None) or _args.gpu_memory_utilization,
+                "max_inference_batch_size": getattr(_args, "qwen_max_inference_batch_size", 128),
+                "max_new_tokens": getattr(_args, "qwen_max_new_tokens", 4096),
             }
-        qwen_kwargs = {
-            "model": _args.qwen_model,
-            "gpu_memory_utilization": getattr(_args, "qwen_gpu_memory_utilization", None) or _args.gpu_memory_utilization,
-            "max_inference_batch_size": getattr(_args, "qwen_max_inference_batch_size", 128),
-            "max_new_tokens": getattr(_args, "qwen_max_new_tokens", 4096),
-        }
-        qwen_max_model_len = getattr(_args, "qwen_max_model_len", None)
-        if qwen_max_model_len:
-            qwen_kwargs["max_model_len"] = qwen_max_model_len
-        if forced_aligner:
-            qwen_kwargs["forced_aligner"] = forced_aligner
-            qwen_kwargs["forced_aligner_kwargs"] = forced_aligner_kwargs
-        _qwen_vllm_model = Qwen3ASRModel.LLM(**qwen_kwargs)
-        logger.info("Qwen3-ASR vLLM model ready!")
+            qwen_max_model_len = getattr(_args, "qwen_max_model_len", None)
+            if qwen_max_model_len:
+                qwen_kwargs["max_model_len"] = qwen_max_model_len
+            if forced_aligner:
+                qwen_kwargs["forced_aligner"] = forced_aligner
+                qwen_kwargs["forced_aligner_kwargs"] = forced_aligner_kwargs
+            _qwen_vllm_model = Qwen3ASRModel.LLM(**qwen_kwargs)
+            set_model_load_state("qwen3_asr_vllm", "loaded")
+            logger.info("Qwen3-ASR vLLM model ready!")
+        except Exception as exc:
+            set_model_load_state("qwen3_asr_vllm", "failed", error=str(exc))
+            raise
     return _qwen_vllm_model
 
 
@@ -557,6 +639,26 @@ def select_batch_processor(model):
     return process_audio
 
 
+def load_model_for_route(model):
+    with _model_init_lock:
+        if model in QWEN3_VLLM_BATCH_ROUTES:
+            load_qwen_vllm_model()
+        elif model in QWEN3_BATCH_ROUTES:
+            load_qwen_model()
+        elif model in NANO_BATCH_ROUTES:
+            load_engine(_args)
+        else:
+            raise ValueError(f"unsupported model route for this service: {model}")
+    return health_payload()["model_load_status"][route_state_key(model)]
+
+
+def preload_models(raw_models):
+    models = [item.strip() for item in re.split(r"[,，\s]+", raw_models or "") if item.strip()]
+    for model in models:
+        logger.info("Preloading model route: %s", model)
+        load_model_for_route(model)
+
+
 def model_path_for_route(model):
     if model in (QWEN3_BATCH_ROUTES | QWEN3_VLLM_BATCH_ROUTES):
         return getattr(_args, "qwen_model", "Qwen/Qwen3-ASR-1.7B")
@@ -588,7 +690,8 @@ async def process_batch_upload_file(
         }
         if processor in (process_audio_qwen3, process_audio_qwen3_vllm):
             processor_kwargs["hotword_prompt_template"] = hotword_prompt_template
-        result = processor(
+        result = await asyncio.to_thread(
+            processor,
             audio_data,
             sr=sr,
             **processor_kwargs,
@@ -682,6 +785,40 @@ async def startup():
 @app.get("/healthz")
 async def healthz():
     return health_payload()
+
+
+@app.post("/models/{route:path}/load")
+async def load_model_endpoint(route: str, background: bool = True):
+    """Explicitly load a model route before the first transcription request."""
+    if route not in SUPPORTED_BATCH_ROUTES:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"unsupported model route for this service: {route}",
+                "supported_routes": sorted(SUPPORTED_BATCH_ROUTES),
+            },
+        )
+
+    state_key = route_state_key(route)
+    current_status = model_load_status_payload()[state_key]
+    if current_status.get("status") == "loaded":
+        return JSONResponse(content={"route": route, **current_status})
+    if current_status.get("status") == "loading":
+        return JSONResponse(status_code=202, content={"route": route, **current_status})
+
+    if background:
+        set_model_load_state(state_key, "loading")
+        asyncio.create_task(asyncio.to_thread(load_model_for_route, route))
+        return JSONResponse(
+            status_code=202,
+            content={"route": route, "status": "loading", "detail": "model loading started"},
+        )
+
+    try:
+        loaded_status = await asyncio.to_thread(load_model_for_route, route)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"route": route, "status": "failed", "error": str(exc)})
+    return JSONResponse(content={"route": route, **loaded_status})
 
 
 # --- HTTP REST: POST /asr ---
@@ -999,6 +1136,7 @@ if __name__ == "__main__":
     parser.add_argument("--qwen-max-model-len", type=int, default=None, help="Optional max model length for the Qwen3-ASR vLLM engine")
     parser.add_argument("--qwen-max-inference-batch-size", type=int, default=128)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=4096)
+    parser.add_argument("--preload-models", type=str, default="", help="Comma-separated model routes to preload before serving, for example qwen3-asr-vllm")
     parser.add_argument("--hub", type=str, default="ms")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--dtype", type=str, default="bf16")
@@ -1010,4 +1148,5 @@ if __name__ == "__main__":
     _args = parser.parse_args()
 
     load_engine(_args)
+    preload_models(_args.preload_models)
     uvicorn.run(app, host=_args.host, port=_args.port)
