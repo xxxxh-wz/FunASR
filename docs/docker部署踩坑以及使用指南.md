@@ -478,6 +478,39 @@ RuntimeError: No CUDA GPUs are available
 - 优先传高频、易错、专业名词。
 - 不要把完整教材术语库无差别塞进每个请求。
 
+### 9.10 长音频 CPU 高、GPU 低不一定是异常
+
+`/asr/subtitles` 是同步接口，返回 ZIP 前会依次经历：
+
+```text
+上传读取 -> 音频解码/重采样 -> VAD -> Qwen vLLM 推理 -> 可选 SPK -> JSON/MD/SRT 渲染 -> ZIP 写出
+```
+
+只有 `qwen_vllm_infer` 阶段会明显拉高 GPU SM 利用率；上传、解码、VAD、SPK 和 ZIP 阶段都可能表现为 CPU 高、GPU 低。长音频请求中，`curl` 显示 `100% upload` 只代表文件已传完，不代表服务端已完成转写。
+
+服务端日志会输出阶段耗时，例如：
+
+```text
+ASR stage=audio_decode elapsed=0.079s file=xxx.m4a sr=48000 duration=60.011
+ASR stage=qwen_vllm_vad elapsed=0.169s duration=60.011 segments=1
+ASR stage=qwen_vllm_wait segments=1 timestamps=False
+ASR stage=qwen_vllm_infer elapsed=4.080s segments=1
+ASR stage=qwen_vllm_total elapsed=4.255s output_segments=1
+ASR stage=zip_write elapsed=0.001s file=xxx.json bytes=4266
+```
+
+排查时优先看：
+
+```bash
+docker logs --tail 200 funasr-asr-server-1
+nvidia-smi dmon -s pucm
+docker stats --no-stream funasr-asr-server-1
+```
+
+如果业务侧会并发提交多个长音频请求，建议在接口前加队列。当前单 GPU 单 vLLM engine 的服务端会串行执行同一模型的推理调用，避免多个长请求同时进入同一个 engine 后互相抢 CPU 线程和 GPU 调度资源。
+
+如果日志停在 `audio_decode`，没有继续出现 `qwen_vllm_vad` / `qwen_vllm_infer`，重点检查解码日志里的 `shape` 和 `channels`。从视频抽出的 m4a 常见为 `48000Hz + stereo`，服务端需要先降为单声道，再重采样到 16k；否则重采样库可能把声道维当作时间维处理，表现为 CPU 持续占用而 GPU 空闲。服务端已在预处理阶段按“单声道化 -> 16k 重采样 -> VAD”的顺序处理，并且 VAD / vLLM 共享模型调用会串行进入。
+
 ## 10. 接口侧建议
 
 调用方建议实现：

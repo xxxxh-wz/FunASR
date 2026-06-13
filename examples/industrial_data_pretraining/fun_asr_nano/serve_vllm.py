@@ -68,6 +68,10 @@ _spk_model = None
 _args = None
 _model_load_lock = threading.Lock()
 _model_init_lock = threading.Lock()
+_engine_inference_lock = threading.Lock()
+_qwen_inference_lock = threading.Lock()
+_qwen_vllm_inference_lock = threading.Lock()
+_vad_inference_lock = threading.Lock()
 _model_load_state = {
     "fun_asr_nano_vllm": {"status": "unloaded", "started_at": None, "ended_at": None, "error": None},
     "qwen3_asr": {"status": "unloaded", "started_at": None, "ended_at": None, "error": None},
@@ -78,6 +82,16 @@ QWEN3_BATCH_ROUTES = {"qwen3-asr", "qwen3-asr-1.7b", "Qwen/Qwen3-ASR-1.7B"}
 QWEN3_VLLM_BATCH_ROUTES = {"qwen3-asr-vllm", "qwen3-asr-1.7b-vllm"}
 SUPPORTED_BATCH_ROUTES = NANO_BATCH_ROUTES | QWEN3_BATCH_ROUTES | QWEN3_VLLM_BATCH_ROUTES
 DEFAULT_HOTWORD_PROMPT_TEMPLATE = "以下是本段音频可能出现的专有名词、课程术语或人名，请在转写时优先参考：{hotwords}"
+
+
+def log_stage(stage, started_at, **fields):
+    elapsed = time.perf_counter() - started_at
+    details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    if details:
+        logger.info("ASR stage=%s elapsed=%.3fs %s", stage, elapsed, details)
+    else:
+        logger.info("ASR stage=%s elapsed=%.3fs", stage, elapsed)
+    return time.perf_counter()
 
 
 def parse_hotwords(raw_hotwords):
@@ -306,21 +320,52 @@ def normalize_qwen_language(language):
     return language_map.get(str(language).strip().lower(), language)
 
 
-def prepare_qwen_segments(audio_data, sr=16000, use_vad=True):
-    if sr != 16000:
-        import librosa
-        audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=16000)
-        sr = 16000
+def audio_shape_info(audio_data):
+    shape = getattr(audio_data, "shape", None)
+    if shape is None:
+        return None, None
+    channels = shape[1] if len(shape) > 1 else 1
+    return "x".join(str(dim) for dim in shape), channels
 
+
+def normalize_audio_for_asr(audio_data, sr=16000, *, stage_prefix="audio"):
     if audio_data.ndim > 1:
         audio_data = audio_data[:, 0]
     audio_data = audio_data.astype(np.float32)
+    if sr != 16000:
+        resample_t0 = time.perf_counter()
+        original_sr = sr
+        import librosa
 
+        audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=16000)
+        sr = 16000
+        log_stage(
+            f"{stage_prefix}_resample",
+            resample_t0,
+            from_sr=original_sr,
+            to_sr=sr,
+            samples=len(audio_data),
+        )
+    return audio_data, sr
+
+
+def run_vad(audio_data, sr, *, use_vad=True, stage_prefix="audio"):
     if use_vad and len(audio_data) > sr * 1:
-        vad_res = _vad_model.generate(input=audio_data, fs=sr)
+        logger.info("ASR stage=%s_vad_wait duration=%.3f", stage_prefix, len(audio_data) / sr)
+        with _vad_inference_lock:
+            vad_t0 = time.perf_counter()
+            vad_res = _vad_model.generate(input=audio_data, fs=sr)
         segments = vad_res[0]["value"]
+        log_stage(f"{stage_prefix}_vad_infer", vad_t0, segments=len(segments or []))
     else:
         segments = [[0, int(len(audio_data) * 1000 / sr)]]
+    return segments
+
+
+def prepare_qwen_segments(audio_data, sr=16000, use_vad=True, stage_prefix="qwen"):
+    audio_data, sr = normalize_audio_for_asr(audio_data, sr, stage_prefix=stage_prefix)
+
+    segments = run_vad(audio_data, sr, use_vad=use_vad, stage_prefix=stage_prefix)
 
     seg_audios = []
     seg_times = []
@@ -355,21 +400,14 @@ def parse_qwen_time_stamp_item(ts):
 def process_audio(audio_data, sr=16000, language=None, hotwords=None, 
                   use_vad=True, use_spk=False, use_timestamp=True):
     """Core processing: VAD segment → vLLM ASR → timestamps → SPK."""
-    if sr != 16000:
-        import librosa
-        audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=16000)
-        sr = 16000
-
-    if audio_data.ndim > 1:
-        audio_data = audio_data[:, 0]
-    audio_data = audio_data.astype(np.float32)
+    total_t0 = time.perf_counter()
+    stage_t0 = time.perf_counter()
+    original_duration = len(audio_data) / sr if sr else 0
+    audio_data, sr = normalize_audio_for_asr(audio_data, sr, stage_prefix="nano")
 
     # VAD segmentation
-    if use_vad and len(audio_data) > sr * 1:
-        vad_res = _vad_model.generate(input=audio_data, fs=sr)
-        segments = vad_res[0]["value"]
-    else:
-        segments = [[0, int(len(audio_data) * 1000 / sr)]]
+    segments = run_vad(audio_data, sr, use_vad=use_vad, stage_prefix="nano")
+    stage_t0 = log_stage("nano_vad", stage_t0, duration=round(original_duration, 3), segments=len(segments or []))
 
     if not segments:
         return {"text": "", "segments": [], "duration": len(audio_data) / sr}
@@ -395,7 +433,11 @@ def process_audio(audio_data, sr=16000, language=None, hotwords=None,
     if hotwords:
         gen_kwargs["hotwords"] = hotwords
 
-    results = _engine.generate(inputs=seg_audios, **gen_kwargs)
+    logger.info("ASR stage=nano_vllm_wait segments=%s", len(seg_audios))
+    with _engine_inference_lock:
+        infer_t0 = time.perf_counter()
+        results = _engine.generate(inputs=seg_audios, **gen_kwargs)
+    log_stage("nano_vllm", infer_t0, segments=len(seg_audios))
 
     # Build segments with timestamps
     output_segments = []
@@ -420,6 +462,7 @@ def process_audio(audio_data, sr=16000, language=None, hotwords=None,
 
     # SPK diarization
     if use_spk and _spk_model is not None:
+        spk_t0 = time.perf_counter()
         from funasr.models.campplus.utils import sv_chunk, postprocess, distribute_spk
         from funasr.models.campplus.cluster_backend import ClusterBackend
 
@@ -441,6 +484,8 @@ def process_audio(audio_data, sr=16000, language=None, hotwords=None,
             distribute_spk(sentences, sv_output)
             for i, s in enumerate(sentences):
                 output_segments[i]["speaker"] = f"SPK{s.get('spk', 0)}"
+        log_stage("nano_spk", spk_t0, chunks=len(chunks) if "chunks" in locals() else 0)
+    log_stage("nano_total", total_t0, output_segments=len(output_segments))
 
     return {
         "text": " ".join(full_text_parts),
@@ -452,7 +497,11 @@ def process_audio(audio_data, sr=16000, language=None, hotwords=None,
 def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None, hotword_prompt_template=None,
                         use_vad=True, use_spk=False, use_timestamp=True):
     """Core Qwen3-ASR processing: VAD segment → Qwen3-ASR batch → optional SPK."""
+    total_t0 = time.perf_counter()
+    input_duration = len(audio_data) / sr if sr else 0
+    stage_t0 = time.perf_counter()
     audio_data, sr, seg_audios, seg_times = prepare_qwen_segments(audio_data, sr, use_vad)
+    log_stage("qwen_vad", stage_t0, duration=round(input_duration, 3), segments=len(seg_audios))
 
     if not seg_audios:
         return {"text": "", "segments": [], "duration": len(audio_data) / sr}
@@ -465,7 +514,11 @@ def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None, hotw
     if use_timestamp:
         gen_kwargs["output_timestamp"] = True
 
-    results = model.generate(input=seg_audios, **gen_kwargs)
+    logger.info("ASR stage=qwen_wait segments=%s", len(seg_audios))
+    with _qwen_inference_lock:
+        infer_t0 = time.perf_counter()
+        results = model.generate(input=seg_audios, **gen_kwargs)
+    log_stage("qwen_infer", infer_t0, segments=len(seg_audios))
     output_segments = []
     full_text_parts = []
     for r, (start_ms, end_ms) in zip(results, seg_times):
@@ -485,6 +538,7 @@ def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None, hotw
         full_text_parts.append(text)
 
     if use_spk and _spk_model is not None:
+        spk_t0 = time.perf_counter()
         from funasr.models.campplus.utils import sv_chunk, postprocess, distribute_spk
         from funasr.models.campplus.cluster_backend import ClusterBackend
 
@@ -506,6 +560,8 @@ def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None, hotw
             distribute_spk(sentences, sv_output)
             for i, s in enumerate(sentences):
                 output_segments[i]["speaker"] = f"SPK{s.get('spk', 0)}"
+        log_stage("qwen_spk", spk_t0, chunks=len(chunks) if "chunks" in locals() else 0)
+    log_stage("qwen_total", total_t0, output_segments=len(output_segments))
 
     return {
         "text": " ".join(full_text_parts),
@@ -517,7 +573,11 @@ def process_audio_qwen3(audio_data, sr=16000, language=None, hotwords=None, hotw
 def process_audio_qwen3_vllm(audio_data, sr=16000, language=None, hotwords=None, hotword_prompt_template=None,
                              use_vad=True, use_spk=False, use_timestamp=True):
     """Core Qwen3-ASR vLLM processing: VAD segment → qwen-asr vLLM batch → optional SPK."""
+    total_t0 = time.perf_counter()
+    input_duration = len(audio_data) / sr if sr else 0
+    stage_t0 = time.perf_counter()
     audio_data, sr, seg_audios, seg_times = prepare_qwen_segments(audio_data, sr, use_vad)
+    log_stage("qwen_vllm_vad", stage_t0, duration=round(input_duration, 3), segments=len(seg_audios))
 
     if not seg_audios:
         return {"text": "", "segments": [], "duration": len(audio_data) / sr}
@@ -526,12 +586,16 @@ def process_audio_qwen3_vllm(audio_data, sr=16000, language=None, hotwords=None,
     qwen_language = normalize_qwen_language(language)
     context = build_hotword_context(hotwords, hotword_prompt_template)
     has_forced_aligner = bool(getattr(_args, "qwen_forced_aligner", "") or "")
-    results = model.transcribe(
-        audio=[(seg_audio, sr) for seg_audio in seg_audios],
-        language=qwen_language,
-        context=context,
-        return_time_stamps=bool(use_timestamp and has_forced_aligner),
-    )
+    logger.info("ASR stage=qwen_vllm_wait segments=%s timestamps=%s", len(seg_audios), bool(use_timestamp and has_forced_aligner))
+    with _qwen_vllm_inference_lock:
+        infer_t0 = time.perf_counter()
+        results = model.transcribe(
+            audio=[(seg_audio, sr) for seg_audio in seg_audios],
+            language=qwen_language,
+            context=context,
+            return_time_stamps=bool(use_timestamp and has_forced_aligner),
+        )
+    log_stage("qwen_vllm_infer", infer_t0, segments=len(seg_audios))
 
     output_segments = []
     full_text_parts = []
@@ -563,6 +627,7 @@ def process_audio_qwen3_vllm(audio_data, sr=16000, language=None, hotwords=None,
         full_text_parts.append(text)
 
     if use_spk and _spk_model is not None:
+        spk_t0 = time.perf_counter()
         from funasr.models.campplus.utils import sv_chunk, postprocess, distribute_spk
         from funasr.models.campplus.cluster_backend import ClusterBackend
 
@@ -584,6 +649,8 @@ def process_audio_qwen3_vllm(audio_data, sr=16000, language=None, hotwords=None,
             distribute_spk(sentences, sv_output)
             for i, s in enumerate(sentences):
                 output_segments[i]["speaker"] = f"SPK{s.get('spk', 0)}"
+        log_stage("qwen_vllm_spk", spk_t0, chunks=len(chunks) if "chunks" in locals() else 0)
+    log_stage("qwen_vllm_total", total_t0, output_segments=len(output_segments))
 
     return {
         "text": " ".join(full_text_parts),
@@ -679,8 +746,23 @@ async def process_batch_upload_file(
     file_name = file.filename or "unknown"
     hotwords_count = len(hotwords or [])
     try:
+        logger.info("ASR file_start name=%s model=%s spk=%s timestamps=%s", file_name, model, speaker_diarization, timestamps)
+        read_t0 = time.perf_counter()
         content = await file.read()
+        log_stage("upload_read", read_t0, file=file_name, bytes=len(content))
+        decode_t0 = time.perf_counter()
         audio_data, sr = read_audio_upload(content, file_name)
+        duration = len(audio_data) / sr if sr else 0
+        audio_shape, audio_channels = audio_shape_info(audio_data)
+        log_stage(
+            "audio_decode",
+            decode_t0,
+            file=file_name,
+            sr=sr,
+            duration=round(duration, 3),
+            shape=audio_shape,
+            channels=audio_channels,
+        )
         processor = select_batch_processor(model)
         processor_kwargs = {
             "language": language or None,
@@ -697,6 +779,14 @@ async def process_batch_upload_file(
             **processor_kwargs,
         )
         item_elapsed = time.perf_counter() - item_t0
+        logger.info(
+            "ASR file_done name=%s model=%s elapsed=%.3fs duration=%.3fs rtf=%.4f status=success",
+            file_name,
+            model,
+            item_elapsed,
+            result.get("duration", 0),
+            item_elapsed / result["duration"] if result.get("duration", 0) > 0 else 0,
+        )
         result.update(
             {
                 "file_name": file_name,
@@ -919,6 +1009,16 @@ async def asr_subtitles_endpoint(
     hw_list = parse_hotwords(hotwords)
     hotword_template = hotword_prompt_template or None
     buffer = io.BytesIO()
+    request_t0 = time.perf_counter()
+    logger.info(
+        "ASR subtitles_start model=%s files=%s formats=%s spk=%s timestamps=%s hotwords=%s",
+        model,
+        len(files),
+        ",".join(formats),
+        speaker_diarization,
+        timestamps,
+        len(hw_list or []),
+    )
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for file in files:
             result = await process_batch_upload_file(
@@ -936,9 +1036,12 @@ async def asr_subtitles_endpoint(
                 language=language,
                 formats=formats,
             ).items():
+                zip_t0 = time.perf_counter()
                 archive.writestr(archive_name, content)
+                log_stage("zip_write", zip_t0, file=archive_name, bytes=len(content.encode("utf-8")))
 
     buffer.seek(0)
+    logger.info("ASR subtitles_done model=%s elapsed=%.3fs zip_bytes=%s", model, time.perf_counter() - request_t0, len(buffer.getvalue()))
     return Response(
         content=buffer.getvalue(),
         media_type="application/zip",
